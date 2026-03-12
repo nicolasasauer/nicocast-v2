@@ -1,0 +1,52 @@
+# ── Default configuration for nicocast-v2 ─────────────────────────────────────
+#
+# Install this file to /etc/nicocast/config.toml on the Raspberry Pi Zero 2W.
+# The binary searches /etc/nicocast/config.toml first, then ./config.toml
+# in the current working directory, then falls back to built-in defaults.
+# All fields are optional; see src/config.rs for the full list of defaults.
+
+# Human-readable name shown in Samsung Smart View and other Miracast sources.
+device_name = "NicoCast-Sink"
+
+# Linux network interface used for WiFi Direct (P2P).
+wifi_interface = "wlan0"
+
+# Linux network interface for USB Ethernet Gadget (management / logging).
+# This interface is deliberately separate from wlan0 so that log access
+# via SSH is not disrupted while a Miracast P2P session is active.
+usb_interface = "usb0"
+
+# RTSP control-plane port (Miracast specification mandates 7236).
+rtsp_port = 7236
+
+# UDP port on which RTP/MPEG-TS payload is received from the source.
+rtp_port = 16384
+
+# Persistent log file path.  The directory must be writable by the process.
+log_file = "/var/log/miracast_rs.log"
+
+[p2p]
+# WPS Primary Device Type advertised in P2P beacons.
+# "7-0050F204-1" = Category 7 (Display), OUI 00:50:F2:04, Subcategory 1 (TV).
+# Samsung Smart View recognises this as a Miracast-capable display.
+wps_dev_type = "7-0050F204-1"
+
+# When false (p2p_no_group_iface=0) wpa_supplicant creates a dedicated
+# group interface for the P2P connection, leaving wlan0 available for
+# management traffic.  Set to true only if your driver requires it.
+no_group_iface = false
+
+# WFD Information Element subelements (hex-encoded) injected into P2P beacons.
+#
+# Byte layout (subelement 0x00 — WFD Device Information, 6 bytes):
+#   00        subelement ID  = 0x00 (Device Info)
+#   0006      length         = 6 bytes
+#   0011      device info    = 0x0011
+#               bits 1:0 = 01  → Primary Sink
+#               bit  4   =  1  → WFD Session Available
+#   1c44      control port   = 0x1C44 = 7236 (RTSP)
+#   00c8      max throughput = 0x00C8 = 200 Mbps
+wfd_subelems = "000600111c4400c8"
+
+# How long (seconds) each P2P listen window lasts before being re-triggered.
+listen_secs = 300

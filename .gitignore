@@ -1,0 +1,19 @@
+# Cargo build artefacts (can be rebuilt from source at any time)
+/target/
+
+# Cargo credentials (never commit)
+.cargo/credentials.toml
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Logs generated during local development
+*.log
