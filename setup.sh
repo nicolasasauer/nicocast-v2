@@ -3,6 +3,8 @@
 # setup.sh — nicocast-v2 first-run setup
 #
 # What this script does:
+#
+#   Docker mode (default, cross-compiles on any x86_64 machine):
 #   1. Builds the nicocast binary via Docker (cross-compilation for aarch64)
 #   2. Copies the binary and config to the Raspberry Pi over SSH
 #   3. Installs GStreamer runtime dependencies on the Pi
@@ -10,15 +12,29 @@
 #   5. Configures log rotation
 #   6. Enables the USB Ethernet Gadget (usb0) for persistent log access
 #
-# Requirements (on your machine):
+#   Native mode (run directly on the Raspberry Pi, or with --native flag):
+#   1. Checks for cargo and installs build dependencies via apt
+#   2. Builds nicocast locally with `cargo build --release`
+#   3. Installs the binary and config locally
+#   4. Installs GStreamer runtime dependencies locally
+#   5. Creates and enables the nicocast systemd service
+#   6. Configures log rotation and USB Ethernet Gadget
+#
+# Requirements (Docker mode):
 #   - Docker (running, accessible without sudo — or with sudo)
 #   - ssh / scp
 #   - The Raspberry Pi must be reachable over the network (WiFi or Ethernet)
 #   - The Pi user must have passwordless sudo (default on Raspberry Pi OS)
 #
+# Requirements (Native mode, run on the Pi itself):
+#   - Rust / cargo (rustup recommended; the script will suggest installation)
+#   - apt (Raspberry Pi OS / Debian)
+#   - sudo privileges
+#
 # Usage:
-#   ./setup.sh                      # prompts for Pi SSH address
-#   ./setup.sh pi@192.168.1.42      # use a specific address
+#   ./setup.sh                        # Docker mode; prompts for Pi SSH address
+#   ./setup.sh pi@192.168.1.42        # Docker mode; use a specific address
+#   ./setup.sh --native               # Native mode; build and install locally
 #   ./setup.sh --logs pi@192.168.7.2  # connect and follow live logs only
 # =============================================================================
 
@@ -26,6 +42,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_LOCAL="$SCRIPT_DIR/nicocast-aarch64"
+
+# ── Sudo helper ───────────────────────────────────────────────────────────────
+# When already running as root, avoid spawning unnecessary sudo processes.
+if [[ $EUID -eq 0 ]]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -50,7 +74,15 @@ echo    "  ───────────────────────
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 LOGS_ONLY=false
+NATIVE_MODE=false
 PI_HOST=""
+
+# Auto-detect native mode: if we are already running on aarch64 assume we are
+# on the Raspberry Pi and can build natively without Docker.
+ARCH="$(uname -m)"
+if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
+  NATIVE_MODE=true
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,8 +90,12 @@ while [[ $# -gt 0 ]]; do
       LOGS_ONLY=true
       shift
       ;;
+    --native)
+      NATIVE_MODE=true
+      shift
+      ;;
     -*)
-      die "Unknown option: $1  (usage: ./setup.sh [--logs] [pi@<address>])"
+      die "Unknown option: $1  (usage: ./setup.sh [--logs] [--native] [pi@<address>])"
       ;;
     *)
       PI_HOST="$1"
@@ -81,12 +117,215 @@ if $LOGS_ONLY; then
   exec ssh "$PI_HOST" "sudo journalctl -u nicocast -f --no-pager -o short-iso"
 fi
 
-# ── Prompt for Pi address if not supplied ─────────────────────────────────────
-if [[ -z "$PI_HOST" ]]; then
-  read -rp "  Enter Raspberry Pi SSH address [pi@raspberrypi.local]: " PI_HOST
-  PI_HOST="${PI_HOST:-pi@raspberrypi.local}"
+# ── Prompt for Pi address if not supplied (Docker mode only) ──────────────────
+if ! $NATIVE_MODE; then
+  if [[ -z "$PI_HOST" ]]; then
+    read -rp "  Enter Raspberry Pi SSH address [pi@raspberrypi.local]: " PI_HOST
+    PI_HOST="${PI_HOST:-pi@raspberrypi.local}"
+  fi
+  info "Target Pi: ${BOLD}${PI_HOST}${NC}"
 fi
-info "Target Pi: ${BOLD}${PI_HOST}${NC}"
+
+# =============================================================================
+# ── NATIVE BUILD MODE ─────────────────────────────────────────────────────────
+# Runs entirely on the Raspberry Pi without Docker or SSH.
+# =============================================================================
+if $NATIVE_MODE; then
+  info "Mode: ${BOLD}Native Build${NC}  (arch: ${ARCH})"
+
+  # ===========================================================================
+  # Native Step 1/6 — Check cargo + install build dependencies
+  # ===========================================================================
+  step "Step 1/6 — Checking cargo and installing build dependencies"
+
+  if ! command -v cargo &>/dev/null; then
+    echo ""
+    error "cargo (Rust) is not installed."
+    echo ""
+    echo "  Install Rust via rustup:"
+    echo ""
+    echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo "    source \$HOME/.cargo/env"
+    echo ""
+    echo "  Then re-run this script with --native."
+    exit 1
+  fi
+  success "cargo OK  ($(cargo --version))"
+
+  info "Installing build dependencies via apt…"
+  $SUDO apt-get update -qq
+  $SUDO apt-get install -y -qq \
+    build-essential \
+    pkg-config \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libdbus-1-dev
+  success "Build dependencies installed"
+
+  # ===========================================================================
+  # Native Step 2/6 — Build with cargo
+  # ===========================================================================
+  step "Step 2/6 — Building nicocast locally with cargo"
+  info "Running: cargo build --release"
+  echo ""
+
+  cd "$SCRIPT_DIR"
+  cargo build --release \
+    || die "cargo build --release failed. Check the error output above."
+
+  NATIVE_BINARY="$SCRIPT_DIR/target/release/nicocast"
+  success "Binary ready: $NATIVE_BINARY  ($(du -sh "$NATIVE_BINARY" | cut -f1))"
+
+  # ===========================================================================
+  # Native Step 3/6 — Install binary and config
+  # ===========================================================================
+  step "Step 3/6 — Installing binary and config"
+
+  $SUDO mkdir -p /etc/nicocast /usr/local/bin
+  $SUDO cp "$NATIVE_BINARY" /usr/local/bin/nicocast
+  $SUDO chmod +x /usr/local/bin/nicocast
+  $SUDO cp "$SCRIPT_DIR/config.toml" /etc/nicocast/config.toml
+
+  success "Binary installed at /usr/local/bin/nicocast"
+  success "Config installed at /etc/nicocast/config.toml"
+
+  # ===========================================================================
+  # Native Step 4/6 — Install GStreamer runtime dependencies
+  # ===========================================================================
+  step "Step 4/6 — Installing GStreamer runtime dependencies"
+  info "This requires internet access and may take a minute…"
+
+  $SUDO apt-get update -qq
+  $SUDO apt-get install -y -qq \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-tools
+
+  success "GStreamer dependencies installed"
+
+  # ===========================================================================
+  # Native Step 5/6 — systemd service + log rotation
+  # ===========================================================================
+  step "Step 5/6 — Creating systemd service and log rotation"
+
+  $SUDO tee /etc/systemd/system/nicocast.service > /dev/null <<'SERVICE'
+[Unit]
+Description=NicoCast Miracast Sink
+After=network.target dbus.service wpa_supplicant.service
+Wants=dbus.service wpa_supplicant.service
+
+[Service]
+ExecStart=/usr/local/bin/nicocast
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nicocast
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable nicocast
+
+  $SUDO tee /etc/logrotate.d/nicocast > /dev/null <<'LOGROTATE'
+/var/log/miracast_rs.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 640 root adm
+    postrotate
+        systemctl kill -s HUP nicocast.service 2>/dev/null || true
+    endscript
+}
+LOGROTATE
+
+  success "systemd service enabled (auto-starts at boot)"
+  success "Log rotation configured (/etc/logrotate.d/nicocast)"
+
+  # ===========================================================================
+  # Native Step 6/6 — USB Ethernet Gadget
+  # ===========================================================================
+  step "Step 6/6 — Configuring USB Ethernet Gadget (usb0)"
+  info "Enables persistent SSH/log access on 192.168.7.2, independent of WiFi."
+
+  NATIVE_GADGET_CHANGED=0
+
+  if [[ -f /boot/firmware/config.txt ]]; then
+    CONFIG_TXT="/boot/firmware/config.txt"
+  else
+    CONFIG_TXT="/boot/config.txt"
+  fi
+
+  if ! grep -q "dtoverlay=dwc2" "$CONFIG_TXT" 2>/dev/null; then
+    echo "dtoverlay=dwc2,dr_mode=peripheral" | $SUDO tee -a "$CONFIG_TXT" > /dev/null
+    NATIVE_GADGET_CHANGED=1
+  fi
+
+  if [[ -f /boot/firmware/cmdline.txt ]]; then
+    CMDLINE="/boot/firmware/cmdline.txt"
+  else
+    CMDLINE="/boot/cmdline.txt"
+  fi
+
+  if ! grep -q "g_ether" "$CMDLINE" 2>/dev/null; then
+    $SUDO sed -i '1 s/$/ modules-load=dwc2,g_ether/' "$CMDLINE"
+    NATIVE_GADGET_CHANGED=1
+  fi
+
+  if ! nmcli connection show "USB Gadget" &>/dev/null 2>&1; then
+    $SUDO nmcli connection add \
+      type ethernet \
+      ifname usb0 \
+      con-name "USB Gadget" \
+      ipv4.method manual \
+      ipv4.addresses 192.168.7.2/24 \
+      connection.autoconnect yes 2>/dev/null || true
+  fi
+
+  if [[ "$NATIVE_GADGET_CHANGED" == "1" ]]; then
+    success "USB Gadget kernel modules configured (reboot required)"
+    NATIVE_REBOOT_NEEDED=true
+  else
+    success "USB Gadget already configured"
+    NATIVE_REBOOT_NEEDED=false
+  fi
+
+  # ===========================================================================
+  # Done (Native mode)
+  # ===========================================================================
+  echo ""
+  echo -e "${BOLD}${GREEN}  ✓ Native setup complete!${NC}"
+  echo    "  ─────────────────────────────────────────────────────"
+  echo ""
+
+  if $NATIVE_REBOOT_NEEDED; then
+    echo -e "  ${BOLD}Next step: reboot the Pi${NC} to activate the USB Ethernet Gadget."
+    echo ""
+    echo "    sudo reboot"
+    echo ""
+  fi
+
+  echo -e "  ${BOLD}Start nicocast:${NC}"
+  echo ""
+  echo "    sudo systemctl start nicocast"
+  echo ""
+
+  echo -e "  ${BOLD}Follow live logs:${NC}"
+  echo ""
+  echo "    sudo journalctl -u nicocast -f"
+  echo ""
+  echo "  See README.md for the full configuration reference and troubleshooting guide."
+  echo ""
+  exit 0
+fi
+
+# =============================================================================
+# ── DOCKER BUILD MODE (default) ───────────────────────────────────────────────
+# =============================================================================
 
 # =============================================================================
 # Step 1 — Prerequisites
