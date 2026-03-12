@@ -24,6 +24,12 @@ FROM debian:bookworm-slim AS builder
 RUN dpkg --add-architecture arm64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # ── Native C compiler (required for Rust build scripts / proc-macros) ─── #
+    # Rust build scripts and proc-macro crates (e.g. quote, proc-macro2, libc)
+    # are always compiled for the HOST architecture, even during a cross-build.
+    # They invoke the native linker `cc`; without it cargo exits with
+    # "error: linker `cc` not found".
+    gcc \
     # ── Cross-compilation toolchain ──────────────────────────────────────── #
     gcc-aarch64-linux-gnu \
     g++-aarch64-linux-gnu \
