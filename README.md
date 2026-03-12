@@ -9,6 +9,48 @@ an active Miracast P2P session.
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/nicolasasauer/nicocast-v2.git
+cd nicocast-v2
+
+# 2. Run the setup script — it handles everything
+./setup.sh
+```
+
+`setup.sh` will:
+
+1. Build the `nicocast` binary for `aarch64` via Docker
+2. Copy the binary and `config.toml` to your Raspberry Pi
+3. Install GStreamer runtime dependencies on the Pi
+4. Create and enable the `nicocast` systemd service (auto-starts at boot)
+5. Configure log rotation
+6. Enable the USB Ethernet Gadget (`usb0`) for persistent SSH/log access
+
+**Requirements on your machine:** Docker, `ssh`, `scp`
+
+**Requirements on the Pi:** Raspberry Pi OS Bookworm 64-bit, internet access
+(for `apt`), passwordless `sudo` (default on Raspberry Pi OS)
+
+### Follow live logs
+
+```bash
+# Stream the systemd journal for nicocast directly from your laptop
+./setup.sh --logs pi@192.168.7.2
+
+# Or via SSH directly on the Pi
+ssh pi@192.168.7.2 'sudo journalctl -u nicocast -f'
+```
+
+### Re-deploy after code changes
+
+Re-running `./setup.sh` is safe and idempotent — Docker layer caching makes
+rebuilds fast, and every install step is skipped if already up-to-date.
+
+---
+
 ## Architecture
 
 ```
@@ -255,6 +297,8 @@ To prevent the log from growing indefinitely, create
 
 ## Building for the Raspberry Pi (Cross-Compilation)
 
+> **Recommended:** use `./setup.sh` — it runs all steps below automatically.
+
 The `Dockerfile` in this repository performs a complete cross-compilation
 from any `x86_64` Linux host (or CI runner) to `aarch64-unknown-linux-gnu`.
 
@@ -289,6 +333,8 @@ ssh pi@192.168.7.2 "sudo chmod +x /usr/local/bin/nicocast"
 ---
 
 ## Installing as a systemd Service
+
+> **Recommended:** use `./setup.sh` — it creates and enables the service automatically.
 
 Create `/etc/systemd/system/nicocast.service` on the Pi:
 
