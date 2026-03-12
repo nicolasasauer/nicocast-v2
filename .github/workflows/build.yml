@@ -61,8 +61,11 @@ jobs:
 
       # ── 4a. Rolling "latest" pre-release (main branch only) ──────────────────
       # Deletes and recreates the "latest" release so the download URL
-      #   https://github.com/.../releases/latest/download/nicocast-aarch64
+      #   https://github.com/.../releases/download/latest/nicocast-aarch64
       # always points to the most recent build from main.
+      # NOTE: published as --prerelease so GitHub's /releases/latest redirect
+      # (which only resolves non-prerelease releases) is intentionally bypassed
+      # by setup.sh using the direct /releases/download/<tag>/ URL form.
       - name: Publish rolling "latest" pre-release
         if: github.ref == 'refs/heads/main'
         env:
