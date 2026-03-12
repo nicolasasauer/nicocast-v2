@@ -1,0 +1,50 @@
+[package]
+name = "nicocast-v2"
+version = "0.1.0"
+edition = "2021"
+description = "Miracast Sink (Receiver) for Raspberry Pi Zero 2W with Samsung Smart View support"
+authors = ["nicocast"]
+license = "MIT"
+
+[[bin]]
+name = "nicocast"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# D-Bus for wpa_supplicant P2P control
+zbus = { version = "4", features = ["tokio"] }
+zvariant = "4"
+
+# GStreamer multimedia pipeline
+# Minimum 0.25 for GStreamer 1.28 API compatibility, Bus::timed_pop() semantics
+# fix (0.25.0), and MSRV 1.92 alignment (we target Rust ≥ 1.92).
+gstreamer = "0.25"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async trait support
+async-trait = "0.1"
+
+# Byte utilities
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

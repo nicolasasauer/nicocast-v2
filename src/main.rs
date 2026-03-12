@@ -1,0 +1,82 @@
+//! nicocast-v2 — Miracast Sink for Raspberry Pi Zero 2W
+//!
+//! Supports Samsung Smart View via WiFi Direct (P2P), hardware-accelerated
+//! H.264 decoding with v4l2h264dec, and persistent logging over USB Gadget.
+
+mod config;
+mod logger;
+mod p2p;
+mod rtsp;
+mod video;
+
+use anyhow::Result;
+use tracing::{error, info};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Load configuration (falls back to defaults if file is missing)
+    let cfg = config::Config::load("config.toml").unwrap_or_else(|e| {
+        eprintln!("Warning: could not load config.toml ({e}), using defaults");
+        config::Config::default()
+    });
+
+    // Initialise file-based + console logging.
+    // The guard MUST be kept alive for the duration of the process so that
+    // the background log-writer thread keeps flushing to disk.
+    let _log_guard = logger::init(&cfg.log_file)?;
+
+    info!("nicocast-v2 starting (device: {})", cfg.device_name);
+    info!(
+        "WiFi interface: {}, USB interface: {}",
+        cfg.wifi_interface, cfg.usb_interface
+    );
+
+    // Initialise GStreamer once for the whole process
+    gstreamer::init()?;
+
+    // Spawn the GStreamer video pipeline (waits for a UDP stream on cfg.rtp_port)
+    let video_handle = {
+        let cfg_clone = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = video::run_pipeline(&cfg_clone).await {
+                error!("Video pipeline error: {e:#}");
+            }
+        })
+    };
+
+    // Spawn the RTSP control-plane server (Miracast M1–M16 exchange)
+    let rtsp_handle = {
+        let cfg_clone = cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rtsp::serve(&cfg_clone).await {
+                error!("RTSP server error: {e:#}");
+            }
+        })
+    };
+
+    // Bring up the P2P manager (wpa_supplicant D-Bus, WFD IEs, Samsung Smart View)
+    let p2p_handle = {
+        let cfg_clone = cfg.clone();
+        tokio::spawn(async move {
+            match p2p::P2pManager::new(&cfg_clone).await {
+                Ok(mut mgr) => {
+                    if let Err(e) = mgr.run().await {
+                        error!("P2P manager error: {e:#}");
+                    }
+                }
+                Err(e) => error!("P2P manager init error: {e:#}"),
+            }
+        })
+    };
+
+    // Wait for all tasks (they run indefinitely unless an error occurs)
+    tokio::select! {
+        _ = video_handle => info!("Video pipeline task exited"),
+        _ = rtsp_handle  => info!("RTSP server task exited"),
+        _ = p2p_handle   => info!("P2P manager task exited"),
+        _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C, shutting down"),
+    }
+
+    info!("nicocast-v2 stopped");
+    Ok(())
+}
