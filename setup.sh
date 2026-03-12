@@ -265,8 +265,8 @@ if $NATIVE_MODE; then
   $SUDO tee /etc/systemd/system/nicocast.service > /dev/null <<'SERVICE'
 [Unit]
 Description=NicoCast Miracast Sink
-After=network.target dbus.service wpa_supplicant.service
-Wants=dbus.service wpa_supplicant.service
+After=network.target network-online.target dbus.service wpa_supplicant.service
+Wants=network-online.target dbus.service wpa_supplicant.service
 
 [Service]
 ExecStart=/usr/local/bin/nicocast
@@ -275,6 +275,7 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=nicocast
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]
 WantedBy=multi-user.target
@@ -496,8 +497,8 @@ set -euo pipefail
 sudo tee /etc/systemd/system/nicocast.service > /dev/null <<'SERVICE'
 [Unit]
 Description=NicoCast Miracast Sink
-After=network.target dbus.service wpa_supplicant.service
-Wants=dbus.service wpa_supplicant.service
+After=network.target network-online.target dbus.service wpa_supplicant.service
+Wants=network-online.target dbus.service wpa_supplicant.service
 
 [Service]
 ExecStart=/usr/local/bin/nicocast
@@ -506,6 +507,7 @@ RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=nicocast
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]
 WantedBy=multi-user.target
