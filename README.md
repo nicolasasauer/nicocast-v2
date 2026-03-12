@@ -1,5 +1,7 @@
 # nicocast-v2
 
+> **⚠️ Disclaimer:** Dieses Projekt wurde vollständig mit Hilfe von KI-Agenten (GitHub Copilot Coding Agent) erstellt. Der gesamte Code, die Dokumentation und die Konfigurationsdateien wurden durch KI generiert und können Fehler enthalten. Eine sorgfältige Prüfung vor dem produktiven Einsatz wird empfohlen.
+
 Miracast Sink (Receiver) for the **Raspberry Pi Zero 2W**, written in Rust.
 
 Supports **Samsung Smart View** out of the box via WiFi Direct (P2P) and
