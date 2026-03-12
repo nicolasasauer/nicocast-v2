@@ -11,45 +11,76 @@ an active Miracast P2P session.
 
 ---
 
-## Quick Start
+## Quick Start — on the Raspberry Pi
+
+The recommended workflow requires no cross-compilation tools on your laptop.
+A GitHub Actions workflow automatically builds the binary and publishes it as
+a [GitHub Release](https://github.com/nicolasasauer/nicocast-v2/releases/latest).
+`setup.sh` downloads it directly on the Pi.
+
+**Requirements on the Pi:** Raspberry Pi OS Bookworm 64-bit, internet access,
+`curl` (pre-installed), passwordless `sudo` (default on Raspberry Pi OS).
 
 ```bash
-# 1. Clone the repository
+# 1. Clone the repository on the Raspberry Pi
 git clone https://github.com/nicolasasauer/nicocast-v2.git
 cd nicocast-v2
 
-# 2. Run the setup script — it handles everything
+# 2. Run the setup script — it downloads the binary and handles everything
 ./setup.sh
 ```
 
-`setup.sh` will:
+`setup.sh` will (on aarch64 / Raspberry Pi):
 
-1. Build the `nicocast` binary for `aarch64` via Docker
-2. Copy the binary and `config.toml` to your Raspberry Pi
-3. Install GStreamer runtime dependencies on the Pi
+1. Download the pre-built `aarch64` binary from the latest GitHub Release
+2. Install the binary to `/usr/local/bin/nicocast` and config to `/etc/nicocast/`
+3. Install GStreamer runtime dependencies via `apt`
 4. Create and enable the `nicocast` systemd service (auto-starts at boot)
-5. Configure log rotation
-6. Enable the USB Ethernet Gadget (`usb0`) for persistent SSH/log access
+5. Configure the USB Ethernet Gadget (`usb0`) for persistent SSH/log access
 
-**Requirements on your machine:** Docker, `ssh`, `scp`
-
-**Requirements on the Pi:** Raspberry Pi OS Bookworm 64-bit, internet access
-(for `apt`), passwordless `sudo` (default on Raspberry Pi OS)
+> **Note:** If no release binary is available yet (e.g. on the very first push
+> before GitHub Actions has completed), pass `--build` to compile from source
+> instead: `./setup.sh --build`
 
 ### Follow live logs
 
 ```bash
-# Stream the systemd journal for nicocast directly from your laptop
-./setup.sh --logs pi@192.168.7.2
+# Follow systemd journal directly on the Pi
+sudo journalctl -u nicocast -f
 
-# Or via SSH directly on the Pi
-ssh pi@192.168.7.2 'sudo journalctl -u nicocast -f'
+# Or stream it from your laptop (via USB Ethernet on 192.168.7.2)
+ssh pi@192.168.7.2 'sudo journalctl -u nicocast -f --no-pager -o short-iso'
 ```
 
-### Re-deploy after code changes
+### Update to the latest build
 
-Re-running `./setup.sh` is safe and idempotent — Docker layer caching makes
-rebuilds fast, and every install step is skipped if already up-to-date.
+Re-running `./setup.sh` is safe and idempotent.  It downloads the newest
+release binary, re-installs it, and restarts the service.
+
+---
+
+## Developer Workflow — from a Laptop (Docker mode)
+
+If you prefer to cross-compile and deploy in one step from your development
+machine, `setup.sh` also supports a Docker mode.  It is selected automatically
+on non-aarch64 hosts.
+
+**Requirements:** Docker, `ssh`, `scp`, the Pi reachable over the network.
+
+```bash
+# 1. Clone on your laptop
+git clone https://github.com/nicolasasauer/nicocast-v2.git
+cd nicocast-v2
+
+# 2. Build and deploy to the Pi in one step
+./setup.sh                        # prompts for Pi SSH address
+./setup.sh pi@192.168.1.42        # or pass the address directly
+```
+
+```bash
+# Stream live logs from your laptop
+./setup.sh --logs pi@192.168.7.2
+```
 
 ---
 
@@ -297,9 +328,39 @@ To prevent the log from growing indefinitely, create
 
 ---
 
+## CI/CD — Automated Binary Builds
+
+Every push to `main` triggers the GitHub Actions workflow in
+`.github/workflows/build.yml`, which:
+
+1. Runs on an `ubuntu-latest` GitHub-hosted runner
+2. Cross-compiles the binary for `aarch64-unknown-linux-gnu` inside the
+   existing Docker container (same Dockerfile used for local builds)
+3. Publishes the binary as a GitHub Release named **`latest`** — a rolling
+   pre-release that is updated on every commit to `main`
+
+The stable download URL is always:
+
+```
+https://github.com/nicolasasauer/nicocast-v2/releases/latest/download/nicocast-aarch64
+```
+
+`setup.sh` uses this URL automatically when run on the Pi.
+
+Versioned releases (e.g. `v1.0.0`) are created when you push a semver tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+---
+
 ## Building for the Raspberry Pi (Cross-Compilation)
 
-> **Recommended:** use `./setup.sh` — it runs all steps below automatically.
+> **Recommended:** use `./setup.sh` on the Pi — it downloads the pre-built
+> binary from GitHub Releases without requiring any local toolchain.
+> For manual / offline builds, use the steps below.
 
 The `Dockerfile` in this repository performs a complete cross-compilation
 from any `x86_64` Linux host (or CI runner) to `aarch64-unknown-linux-gnu`.
