@@ -69,6 +69,25 @@ warn()    { echo -e "  ${YELLOW}⚠${NC}  $*"; }
 error()   { echo -e "  ${RED}✗${NC}  $*" >&2; }
 die()     { error "$*"; exit 1; }
 
+# ── apt-get update with retry ─────────────────────────────────────────────────
+# Transient mirror-sync errors cause apt-get update to exit non-zero; retry up
+# to 3 times with exponential back-off before giving up.
+apt_get_update() {
+  local attempt=1 max=3 delay=10
+  while [[ $attempt -le $max ]]; do
+    if $SUDO apt-get update -qq; then
+      return 0
+    fi
+    if [[ $attempt -lt $max ]]; then
+      warn "apt-get update failed (attempt $attempt/$max) — retrying in ${delay}s…"
+      sleep "$delay"
+      delay=$(( delay * 2 ))
+    fi
+    (( attempt++ ))
+  done
+  die "apt-get update failed after $max attempts. Check your network and apt sources."
+}
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}  nicocast-v2 — Miracast Sink for Raspberry Pi Zero 2W${NC}"
@@ -192,7 +211,7 @@ if $NATIVE_MODE; then
     success "cargo OK  ($(cargo --version))"
 
     info "Installing build dependencies via apt…"
-    $SUDO apt-get update -qq
+    apt_get_update
     $SUDO apt-get install -y -qq \
       build-essential \
       pkg-config \
@@ -230,7 +249,7 @@ if $NATIVE_MODE; then
   step "Step 3/5 — Installing GStreamer runtime dependencies"
   info "This requires internet access and may take a minute…"
 
-  $SUDO apt-get update -qq
+  apt_get_update
   $SUDO apt-get install -y -qq \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
@@ -446,7 +465,17 @@ info "This requires internet access on the Pi and may take a minute…"
 
 ssh "$PI_HOST" bash <<'REMOTE'
 set -euo pipefail
-sudo apt-get update -qq
+attempt=1; delay=10
+while [[ $attempt -le 3 ]]; do
+  if sudo apt-get update -qq; then break; fi
+  if [[ $attempt -lt 3 ]]; then
+    echo "  ⚠  apt-get update failed (attempt $attempt/3) — retrying in ${delay}s…" >&2
+    sleep "$delay"; delay=$(( delay * 2 ))
+  else
+    echo "  ✗  apt-get update failed after 3 attempts." >&2; exit 1
+  fi
+  (( attempt++ ))
+done
 sudo apt-get install -y -qq \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
