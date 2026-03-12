@@ -10,7 +10,7 @@ mod rtsp;
 mod video;
 
 use anyhow::Result;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +43,14 @@ async fn main() -> Result<()> {
         "WiFi interface: {}, USB interface: {}",
         cfg.wifi_interface, cfg.usb_interface
     );
+
+    // Ensure XDG_RUNTIME_DIR is set to a valid, writable directory.
+    //
+    // GStreamer (and Wayland/PipeWire/PulseAudio) rely on this variable for
+    // socket and temporary-file placement.  On headless or container systems
+    // the variable is often absent, which causes GStreamer to log
+    // "XDG_RUNTIME_DIR is invalid" and may result in a crash.
+    ensure_xdg_runtime_dir();
 
     // Initialise GStreamer once for the whole process
     gstreamer::init()?;
@@ -115,4 +123,83 @@ async fn main() -> Result<()> {
 
     info!("nicocast-v2 stopped");
     Ok(())
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Guarantee that `XDG_RUNTIME_DIR` is set to a valid, writable directory.
+///
+/// On headless or container systems the variable may be absent or point at a
+/// non-existent path.  GStreamer (and Wayland/PipeWire/PulseAudio) use it for
+/// socket and temporary-file placement; without it they log
+/// *"XDG_RUNTIME_DIR is invalid"* and may crash or behave unexpectedly.
+///
+/// When the variable is missing or its target does not exist this function
+/// falls back to `/tmp/nicocast-runtime`, creates the directory if necessary,
+/// and re-exports `XDG_RUNTIME_DIR` so that child processes inherit the value.
+// `std::env::set_var` was deprecated in Rust 1.81 due to potential unsoundness
+// in multi-threaded programs, but this function runs at startup before any
+// parallel work begins, making this usage safe.
+#[allow(deprecated)]
+fn ensure_xdg_runtime_dir() {
+    const FALLBACK: &str = "/tmp/nicocast-runtime";
+
+    let needs_fallback = match std::env::var("XDG_RUNTIME_DIR") {
+        Err(_) => {
+            // Variable not set at all.
+            true
+        }
+        Ok(val) if val.is_empty() => {
+            // Variable set to an empty string — treat as absent.
+            true
+        }
+        Ok(val) => {
+            // Variable is set; verify the path actually exists *and* is a
+            // directory (not a plain file or symlink to something unexpected).
+            let p = std::path::Path::new(&val);
+            if !p.is_dir() {
+                warn!(
+                    "XDG_RUNTIME_DIR='{}' does not exist or is not a directory; \
+                     falling back to '{FALLBACK}'",
+                    val
+                );
+                true
+            } else {
+                false
+            }
+        }
+    };
+
+    if needs_fallback {
+        if let Err(e) = create_runtime_dir(FALLBACK) {
+            // Non-fatal: log and continue.  GStreamer will log its own warning
+            // but the pipeline may still work (e.g. if no Wayland sink is used).
+            warn!("Could not create fallback XDG_RUNTIME_DIR '{FALLBACK}': {e}");
+        } else {
+            std::env::set_var("XDG_RUNTIME_DIR", FALLBACK);
+            warn!(
+                "XDG_RUNTIME_DIR was not set or invalid; \
+                 using fallback '{FALLBACK}'"
+            );
+        }
+    }
+}
+
+/// Create `path` as a directory accessible only by the current user (mode 0700).
+///
+/// Uses platform-specific APIs on Unix to apply restrictive permissions at
+/// creation time, reducing the window for privilege-escalation attacks in `/tmp`.
+fn create_runtime_dir(path: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
