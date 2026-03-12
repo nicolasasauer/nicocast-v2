@@ -38,6 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer-plugins-base1.0-dev:arm64 \
     # glib-2.0 and gobject-2.0 are transitive deps of GStreamer
     libglib2.0-dev:arm64 \
+    # ── Binary introspection (used to verify the cross-compiled ELF) ──────── #
+    file \
     # ── Rust installer prerequisites ──────────────────────────────────────── #
     curl \
     ca-certificates \

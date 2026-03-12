@@ -14,11 +14,24 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration (falls back to defaults if file is missing)
-    let cfg = config::Config::load("config.toml").unwrap_or_else(|e| {
-        eprintln!("Warning: could not load config.toml ({e}), using defaults");
-        config::Config::default()
-    });
+    // Load configuration.
+    //
+    // Search order (first file that exists and parses wins):
+    //   1. /etc/nicocast/config.toml  — system-wide install (Dockerfile default)
+    //   2. ./config.toml              — development / side-by-side fallback
+    //
+    // If neither is found the built-in defaults are used and a warning is printed.
+    const CONFIG_PATHS: &[&str] = &["/etc/nicocast/config.toml", "config.toml"];
+    let cfg = CONFIG_PATHS
+        .iter()
+        .find_map(|path| config::Config::load(path).ok())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Warning: no config file found at {:?}, using built-in defaults",
+                CONFIG_PATHS
+            );
+            config::Config::default()
+        });
 
     // Initialise file-based + console logging.
     // The guard MUST be kept alive for the duration of the process so that

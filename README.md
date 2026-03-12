@@ -299,7 +299,7 @@ After=network.target dbus.service wpa_supplicant.service
 Wants=dbus.service wpa_supplicant.service
 
 [Service]
-ExecStart=/usr/local/bin/nicocast --config /etc/nicocast/config.toml
+ExecStart=/usr/local/bin/nicocast
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
@@ -323,8 +323,15 @@ sudo journalctl -u nicocast -f
 
 ## Configuration Reference
 
-All settings live in `config.toml` (installed to `/etc/nicocast/config.toml`
-on the Pi).  Every field is optional and has a built-in default.
+All settings live in `config.toml`.  The binary searches these paths **in
+order** and uses the first file it finds:
+
+1. `/etc/nicocast/config.toml` — system-wide location (installed by the
+   Dockerfile / `scp` workflow)
+2. `./config.toml` — current working directory (useful during development)
+
+If neither file exists the built-in defaults shown below are used.  Every
+field is optional.
 
 | Key | Default | Description |
 |---|---|---|
