@@ -1,0 +1,20 @@
+# Build artefacts
+/target/
+
+# Cargo lock file is committed for binary crates (intentional), but
+# exclude any local override files.
+.cargo/credentials.toml
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Logs generated locally during development
+*.log

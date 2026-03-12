@@ -5,14 +5,21 @@
 //!
 //! ```text
 //! udpsrc port=<rtp_port>
-//!   → tsdemux
+//!   → tsdemux          (dynamic pads — H.264 ES linked in pad-added handler)
 //!   → h264parse
-//!   → v4l2h264dec           ← hardware H.264 on BCM2710A1
+//!   → v4l2h264dec      ← BCM2710A1 hardware decode
 //!   → autovideosink
 //! ```
 //!
-//! The pipeline is started once and runs until the process exits or an
-//! error is received on the GStreamer bus.
+//! # gstreamer-rs 0.25 compatibility notes
+//!
+//! * `Bin::add_many()` accepts `&[&impl IsA<Element>]`.
+//! * Static element linking uses `src.link(dest)` (method call on trait object).
+//! * In a `connect_pad_added` handler, `element.sync_state_with_parent()` must
+//!   be called after the dynamic link is established so the new sub-pipeline
+//!   transitions to PLAYING along with the bin.
+//! * `Bus::timed_pop(timeout)` semantics were corrected in 0.25.0 — a
+//!   `ClockTime` timeout is now honoured consistently.
 
 use anyhow::{bail, Context, Result};
 use gstreamer::{
@@ -25,8 +32,8 @@ use crate::config::Config;
 
 /// Build and run the GStreamer pipeline.
 ///
-/// This function blocks (inside the async executor) until the pipeline
-/// reaches EOS, encounters an error, or the process is interrupted.
+/// Blocks inside the async executor (via `yield_now`) until the pipeline
+/// reaches EOS, encounters an unrecoverable error, or the process exits.
 pub async fn run_pipeline(cfg: &Config) -> Result<()> {
     let pipeline = build_pipeline(cfg).context("building GStreamer pipeline")?;
 
@@ -38,16 +45,14 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
     pipeline
         .set_state(State::Playing)
         .context("setting pipeline to PLAYING")?;
-
     info!("GStreamer pipeline PLAYING");
 
-    let bus = pipeline
-        .bus()
-        .context("getting pipeline bus")?;
+    let bus = pipeline.bus().context("getting pipeline bus")?;
 
-    // Poll the bus in a blocking-friendly async loop
     loop {
-        // `timed_pop` with a 500 ms timeout so we don't block forever
+        // Poll with a 500 ms timeout; yield between polls so tokio can
+        // service other tasks.  Bus::timed_pop semantics were fixed in
+        // gstreamer-rs 0.25.0.
         match bus.timed_pop(ClockTime::from_mseconds(500)) {
             Some(msg) => match msg.view() {
                 MessageView::Eos(_) => {
@@ -60,15 +65,14 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
                         .map(|s| s.path_string().to_string())
                         .unwrap_or_else(|| "<unknown>".into());
                     let gst_err = err.error();
-                    let debug_info = err.debug().unwrap_or_default();
-                    error!("GStreamer error from {src}: {gst_err} ({debug_info})");
-                    // Attempt to shut down cleanly before propagating the error.
+                    let dbg = err.debug().unwrap_or_default();
+                    error!("GStreamer error from {src}: {gst_err} ({dbg})");
                     let _ = pipeline.set_state(State::Null);
-                    bail!("GStreamer error: {gst_err}");
+                    bail!("GStreamer pipeline error: {gst_err}");
                 }
                 MessageView::Warning(w) => {
-                    let debug_info = w.debug().unwrap_or_default();
-                    warn!("GStreamer warning: {} ({debug_info})", w.error());
+                    let dbg = w.debug().unwrap_or_default();
+                    warn!("GStreamer warning: {} ({dbg})", w.error());
                 }
                 MessageView::StateChanged(sc) => {
                     if sc
@@ -86,8 +90,10 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
                 _ => {}
             },
             None => {
-                // No message within the timeout — yield to the async executor
-                tokio::task::yield_now().await;
+                // timed_pop already waited up to 500 ms with no messages.
+                // Sleep briefly before the next poll so this task does not
+                // monopolise its tokio worker thread.
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         }
     }
@@ -101,84 +107,105 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
 
 // ─── pipeline construction ────────────────────────────────────────────────────
 
-/// Construct the GStreamer pipeline:
+/// Construct the element graph:
 ///
-/// `udpsrc ! tsdemux ! h264parse ! v4l2h264dec ! autovideosink`
+/// `udpsrc → tsdemux ⟿ h264parse → v4l2h264dec → autovideosink`
+///
+/// The `⟿` arrow denotes a dynamic pad connection wired in the
+/// `connect_pad_added` handler.
 fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
     let pipeline = Pipeline::new();
 
-    // ── elements ──────────────────────────────────────────────────────────────
-    let udpsrc = make_element("udpsrc", "src")?;
-    let tsdemux = make_element("tsdemux", "demux")?;
-    let h264parse = make_element("h264parse", "parse")?;
-    let v4l2dec = make_element("v4l2h264dec", "decode")?;
-    let videosink = make_element("autovideosink", "sink")?;
+    // ── create elements ───────────────────────────────────────────────────────
+    let udpsrc    = make_element("udpsrc",       "src")?;
+    let tsdemux   = make_element("tsdemux",      "demux")?;
+    let h264parse = make_element("h264parse",    "parse")?;
+    let v4l2dec   = make_element("v4l2h264dec",  "decode")?;
+    let videosink = make_element("autovideosink","sink")?;
 
-    // ── properties ────────────────────────────────────────────────────────────
-    // udpsrc: listen on all interfaces for MPEG-TS
+    // ── configure element properties ─────────────────────────────────────────
+    // udpsrc: receive MPEG-TS datagrams on the configured RTP port
     udpsrc.set_property("port", cfg.rtp_port as i32);
     udpsrc.set_property("caps", &mpeg_ts_caps());
 
-    // autovideosink: disable sync so there is no audio/video drift check
+    // autovideosink: no A/V sync needed (audio not carried in this pipeline)
     videosink.set_property("sync", false);
 
-    // ── add all elements to the pipeline ──────────────────────────────────────
+    // ── add elements to the pipeline (gstreamer-rs 0.25: pass a slice) ───────
     pipeline
-        .add_many([&udpsrc, &tsdemux, &h264parse, &v4l2dec, &videosink])
+        .add_many(&[&udpsrc, &tsdemux, &h264parse, &v4l2dec, &videosink])
         .context("adding elements to pipeline")?;
 
     // ── static links ──────────────────────────────────────────────────────────
-    // udpsrc → tsdemux (static)
-    Element::link(&udpsrc, &tsdemux).context("linking udpsrc → tsdemux")?;
-    // h264parse → v4l2h264dec → autovideosink (static)
-    Element::link_many([&h264parse, &v4l2dec, &videosink])
-        .context("linking h264parse → v4l2h264dec → autovideosink")?;
+    // udpsrc  →  tsdemux   (static; tsdemux exposes dynamic pads below)
+    udpsrc.link(&tsdemux).context("linking udpsrc → tsdemux")?;
+    // h264parse → v4l2h264dec → autovideosink
+    h264parse.link(&v4l2dec).context("linking h264parse → v4l2h264dec")?;
+    v4l2dec.link(&videosink).context("linking v4l2h264dec → autovideosink")?;
 
-    // tsdemux has dynamic pads; connect them to h264parse when they appear.
-    let h264parse_clone = h264parse.clone();
-    tsdemux.connect_pad_added(move |_demux, pad| {
-        let pad_name = pad.name();
+    // ── dynamic pad: tsdemux → h264parse ─────────────────────────────────────
+    // tsdemux adds a pad for each elementary stream it finds in the MPEG-TS.
+    // We hook into `pad-added` to link the first H.264 ES to h264parse.
+    //
+    // gstreamer-rs 0.25: after linking the pad, call sync_state_with_parent()
+    // on the downstream element so it transitions to PLAYING with the bin.
+    let h264parse_weak = h264parse.downgrade();
+    tsdemux.connect_pad_added(move |_demux, src_pad| {
+        let pad_name = src_pad.name();
         debug!("tsdemux: new pad '{pad_name}'");
 
-        // Only link video/x-h264 pads
-        let caps = pad.current_caps().or_else(|| pad.query_caps(None));
+        // Determine caps — prefer already-negotiated caps, fall back to a query.
+        let caps = src_pad
+            .current_caps()
+            .unwrap_or_else(|| src_pad.query_caps(None));
+
         let is_h264 = caps
-            .as_ref()
-            .map(|c| {
-                c.iter()
-                    .any(|s| s.name() == "video/x-h264")
-            })
-            .unwrap_or(false);
+            .iter()
+            .any(|s| s.name().as_str() == "video/x-h264");
 
         if !is_h264 {
             debug!("tsdemux: pad '{pad_name}' is not H.264, skipping");
             return;
         }
 
-        let sink_pad = match h264parse_clone.static_pad("sink") {
+        let h264parse = match h264parse_weak.upgrade() {
+            Some(e) => e,
+            None => {
+                error!("h264parse element was dropped before pad-added fired");
+                return;
+            }
+        };
+
+        let sink_pad = match h264parse.static_pad("sink") {
             Some(p) => p,
             None => {
-                error!("h264parse has no sink pad");
+                error!("h264parse has no static sink pad");
                 return;
             }
         };
 
         if sink_pad.is_linked() {
-            debug!("h264parse sink pad already linked, ignoring pad '{pad_name}'");
+            debug!("h264parse sink already linked; ignoring pad '{pad_name}'");
             return;
         }
 
-        if let Err(e) = pad.link(&sink_pad) {
-            error!("Failed to link tsdemux pad '{pad_name}' to h264parse: {e:?}");
-        } else {
-            info!("tsdemux pad '{pad_name}' linked to h264parse");
+        if let Err(e) = src_pad.link(&sink_pad) {
+            error!("Failed to link tsdemux::{pad_name} → h264parse::sink: {e:?}");
+            return;
+        }
+        info!("Linked tsdemux::{pad_name} → h264parse::sink");
+
+        // Required in gstreamer-rs 0.25 for dynamically linked elements:
+        // bring the element up to the current state of the parent bin.
+        if let Err(e) = h264parse.sync_state_with_parent() {
+            error!("sync_state_with_parent failed for h264parse: {e}");
         }
     });
 
     Ok(pipeline)
 }
 
-/// Build GStreamer `Caps` for MPEG-TS over UDP.
+/// Build GStreamer `Caps` for MPEG-TS over UDP (188-byte packets).
 fn mpeg_ts_caps() -> gstreamer::Caps {
     gstreamer::Caps::builder("video/mpegts")
         .field("systemstream", true)
@@ -186,8 +213,8 @@ fn mpeg_ts_caps() -> gstreamer::Caps {
         .build()
 }
 
-/// Create a GStreamer element by factory name, returning an error if the
-/// plugin is not installed.
+/// Convenience wrapper: create an element by factory name.
+/// Returns a descriptive error when the plugin is missing.
 fn make_element(factory: &str, name: &str) -> Result<Element> {
     ElementFactory::make(factory)
         .name(name)
@@ -195,7 +222,7 @@ fn make_element(factory: &str, name: &str) -> Result<Element> {
         .with_context(|| {
             format!(
                 "creating GStreamer element '{factory}' — \
-                 is the '{factory}' plugin installed?"
+                 is the '{factory}' plugin installed on this device?"
             )
         })
 }
@@ -205,10 +232,8 @@ fn make_element(factory: &str, name: &str) -> Result<Element> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     fn init_gst() {
-        // gstreamer::init is idempotent and safe to call multiple times.
         let _ = gstreamer::init();
     }
 
@@ -217,7 +242,7 @@ mod tests {
         init_gst();
         let caps = mpeg_ts_caps();
         let s = caps.structure(0).expect("caps must have at least one structure");
-        assert_eq!(s.name(), "video/mpegts");
+        assert_eq!(s.name().as_str(), "video/mpegts");
         assert_eq!(s.get::<bool>("systemstream").unwrap(), true);
         assert_eq!(s.get::<i32>("packetsize").unwrap(), 188);
     }

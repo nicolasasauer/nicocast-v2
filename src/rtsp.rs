@@ -188,11 +188,12 @@ fn handle_get_parameter(
     // Empty body = keep-alive ping (M16). Respond with empty 200 OK.
     let body = req.body.trim();
     if body.is_empty() {
-        let extra_headers: Vec<&str> = if let Some(sid) = session_id.as_deref() {
-            vec![&*Box::leak(format!("Session: {sid}").into_boxed_str())]
-        } else {
-            vec![]
-        };
+        // Bind the formatted header to a local so `extra_headers` can borrow
+        // it without leaking memory.
+        let session_hdr = session_id
+            .as_deref()
+            .map(|sid| format!("Session: {sid}"));
+        let extra_headers: Vec<&str> = session_hdr.iter().map(String::as_str).collect();
         return rtsp_response(cseq, 200, "OK", Some(&extra_headers), None);
     }
 
