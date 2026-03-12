@@ -82,13 +82,36 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Wait for all tasks (they run indefinitely unless an error occurs)
-    tokio::select! {
-        _ = video_handle => info!("Video pipeline task exited"),
-        _ = rtsp_handle  => info!("RTSP server task exited"),
-        _ = p2p_handle   => info!("P2P manager task exited"),
-        _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C, shutting down"),
-    }
+    // Wait for the first task to finish; the exit reason is logged so the
+    // service logs show exactly what triggered the shutdown.
+    let exit_reason = tokio::select! {
+        res = video_handle => match res {
+            Ok(()) => "video pipeline task exited normally",
+            Err(e) if e.is_panic() => {
+                error!("Video pipeline task panicked: {e}");
+                "video pipeline task panicked"
+            }
+            Err(_) => "video pipeline task was cancelled",
+        },
+        res = rtsp_handle => match res {
+            Ok(()) => "RTSP server task exited normally",
+            Err(e) if e.is_panic() => {
+                error!("RTSP server task panicked: {e}");
+                "RTSP server task panicked"
+            }
+            Err(_) => "RTSP server task was cancelled",
+        },
+        res = p2p_handle => match res {
+            Ok(()) => "P2P manager task exited normally",
+            Err(e) if e.is_panic() => {
+                error!("P2P manager task panicked: {e}");
+                "P2P manager task panicked"
+            }
+            Err(_) => "P2P manager task was cancelled",
+        },
+        _ = tokio::signal::ctrl_c() => "received Ctrl-C signal",
+    };
+    info!("Shutdown triggered: {exit_reason}");
 
     info!("nicocast-v2 stopped");
     Ok(())

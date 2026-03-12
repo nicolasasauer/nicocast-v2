@@ -30,6 +30,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
+// ─── drop-safe pipeline guard ─────────────────────────────────────────────────
+
+/// Wraps a [`Pipeline`] and ensures `set_state(Null)` is called when dropped,
+/// even if the owning task is cancelled or aborted.  This prevents GStreamer
+/// warnings about elements being disposed while still in PLAYING/PAUSED state.
+struct PipelineGuard(Pipeline);
+
+impl Drop for PipelineGuard {
+    fn drop(&mut self) {
+        let _ = self.0.set_state(State::Null);
+    }
+}
+
 /// Build and run the GStreamer pipeline.
 ///
 /// Blocks inside the async executor (via `yield_now`) until the pipeline
@@ -47,17 +60,20 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
         .context("setting pipeline to PLAYING")?;
     info!("GStreamer pipeline PLAYING");
 
-    let bus = pipeline.bus().context("getting pipeline bus")?;
+    // PipelineGuard ensures set_state(Null) is called even if this task is
+    // aborted or cancelled before the loop reaches its normal exit.
+    let guard = PipelineGuard(pipeline);
+    let bus = guard.0.bus().context("getting pipeline bus")?;
 
-    loop {
+    let exit_reason = loop {
         // Poll with a 500 ms timeout; yield between polls so tokio can
         // service other tasks.  Bus::timed_pop semantics were fixed in
         // gstreamer-rs 0.25.0.
         match bus.timed_pop(ClockTime::from_mseconds(500)) {
             Some(msg) => match msg.view() {
                 MessageView::Eos(_) => {
-                    info!("GStreamer: End-of-Stream received");
-                    break;
+                    info!("GStreamer bus: End-of-Stream received — pipeline loop exiting");
+                    break "EOS";
                 }
                 MessageView::Error(err) => {
                     let src = err
@@ -66,8 +82,13 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
                         .unwrap_or_else(|| "<unknown>".into());
                     let gst_err = err.error();
                     let dbg = err.debug().unwrap_or_default();
-                    error!("GStreamer error from {src}: {gst_err} ({dbg})");
-                    let _ = pipeline.set_state(State::Null);
+                    error!(
+                        "GStreamer bus: Error from '{src}' — {gst_err} (debug: {dbg}); \
+                         pipeline loop exiting"
+                    );
+                    // Explicitly transition to NULL before the guard drops so
+                    // the error message is the last thing logged.
+                    let _ = guard.0.set_state(State::Null);
                     bail!("GStreamer pipeline error: {gst_err}");
                 }
                 MessageView::Warning(w) => {
@@ -77,7 +98,7 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
                 MessageView::StateChanged(sc) => {
                     if sc
                         .src()
-                        .map(|s| s == pipeline.upcast_ref::<gstreamer::Object>())
+                        .map(|s| s == guard.0.upcast_ref::<gstreamer::Object>())
                         .unwrap_or(false)
                     {
                         debug!(
@@ -96,12 +117,14 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         }
-    }
+    };
 
-    pipeline
+    // Transition to NULL; the guard's Drop will be a no-op after this.
+    guard
+        .0
         .set_state(State::Null)
         .context("stopping GStreamer pipeline")?;
-    info!("GStreamer pipeline stopped");
+    info!("GStreamer pipeline stopped (exit reason: {exit_reason})");
     Ok(())
 }
 
