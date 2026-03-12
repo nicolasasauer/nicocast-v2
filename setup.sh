@@ -4,7 +4,15 @@
 #
 # What this script does:
 #
-#   Docker mode (default, cross-compiles on any x86_64 machine):
+#   Native mode (default on aarch64 / Raspberry Pi):
+#   1. Downloads the pre-built aarch64 binary from GitHub Releases
+#      (falls back to cargo build --release if download fails or --build used)
+#   2. Installs the binary to /usr/local/bin and config to /etc/nicocast
+#   3. Installs GStreamer runtime dependencies via apt
+#   4. Creates and enables the nicocast systemd service (auto-starts at boot)
+#   5. Configures USB Ethernet Gadget (usb0) for persistent SSH/log access
+#
+#   Docker mode (default on x86_64 — cross-compiles and deploys over SSH):
 #   1. Builds the nicocast binary via Docker (cross-compilation for aarch64)
 #   2. Copies the binary and config to the Raspberry Pi over SSH
 #   3. Installs GStreamer runtime dependencies on the Pi
@@ -12,29 +20,24 @@
 #   5. Configures log rotation
 #   6. Enables the USB Ethernet Gadget (usb0) for persistent log access
 #
-#   Native mode (run directly on the Raspberry Pi, or with --native flag):
-#   1. Checks for cargo and installs build dependencies via apt
-#   2. Builds nicocast locally with `cargo build --release`
-#   3. Installs the binary and config locally
-#   4. Installs GStreamer runtime dependencies locally
-#   5. Creates and enables the nicocast systemd service
-#   6. Configures log rotation and USB Ethernet Gadget
+# Requirements (Native mode, run on the Pi itself):
+#   - curl (pre-installed on Raspberry Pi OS)
+#   - apt (Raspberry Pi OS / Debian)
+#   - sudo privileges
+#   - internet access (to download binary + GStreamer packages)
+#   - Rust / cargo only needed when --build is passed (or download fails)
 #
-# Requirements (Docker mode):
+# Requirements (Docker mode, run on a developer laptop):
 #   - Docker (running, accessible without sudo — or with sudo)
 #   - ssh / scp
 #   - The Raspberry Pi must be reachable over the network (WiFi or Ethernet)
 #   - The Pi user must have passwordless sudo (default on Raspberry Pi OS)
 #
-# Requirements (Native mode, run on the Pi itself):
-#   - Rust / cargo (rustup recommended; the script will suggest installation)
-#   - apt (Raspberry Pi OS / Debian)
-#   - sudo privileges
-#
 # Usage:
-#   ./setup.sh                        # Docker mode; prompts for Pi SSH address
-#   ./setup.sh pi@192.168.1.42        # Docker mode; use a specific address
-#   ./setup.sh --native               # Native mode; build and install locally
+#   ./setup.sh                        # auto-detect mode (Pi → native, x86 → Docker)
+#   ./setup.sh --native               # force native mode on any arch
+#   ./setup.sh --build                # native mode but compile from source
+#   ./setup.sh pi@192.168.1.42        # Docker mode; use a specific Pi address
 #   ./setup.sh --logs pi@192.168.7.2  # connect and follow live logs only
 # =============================================================================
 
@@ -75,6 +78,7 @@ echo    "  ───────────────────────
 # ── Parse arguments ───────────────────────────────────────────────────────────
 LOGS_ONLY=false
 NATIVE_MODE=false
+FORCE_BUILD=false
 PI_HOST=""
 
 # Auto-detect native mode: if we are already running on aarch64 assume we are
@@ -94,8 +98,13 @@ while [[ $# -gt 0 ]]; do
       NATIVE_MODE=true
       shift
       ;;
+    --build)
+      FORCE_BUILD=true
+      NATIVE_MODE=true   # --build implies native mode
+      shift
+      ;;
     -*)
-      die "Unknown option: $1  (usage: ./setup.sh [--logs] [--native] [pi@<address>])"
+      die "Unknown option: $1  (usage: ./setup.sh [--logs] [--native] [--build] [pi@<address>])"
       ;;
     *)
       PI_HOST="$1"
@@ -127,59 +136,81 @@ if ! $NATIVE_MODE; then
 fi
 
 # =============================================================================
-# ── NATIVE BUILD MODE ─────────────────────────────────────────────────────────
+# ── NATIVE MODE ───────────────────────────────────────────────────────────────
 # Runs entirely on the Raspberry Pi without Docker or SSH.
+# By default, downloads the pre-built aarch64 binary published by the GitHub
+# Actions workflow.  Pass --build to compile from source instead.
 # =============================================================================
 if $NATIVE_MODE; then
-  info "Mode: ${BOLD}Native Build${NC}  (arch: ${ARCH})"
-
-  # ===========================================================================
-  # Native Step 1/6 — Check cargo + install build dependencies
-  # ===========================================================================
-  step "Step 1/6 — Checking cargo and installing build dependencies"
-
-  if ! command -v cargo &>/dev/null; then
-    echo ""
-    error "cargo (Rust) is not installed."
-    echo ""
-    echo "  Install Rust via rustup:"
-    echo ""
-    echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    echo "    source \$HOME/.cargo/env"
-    echo ""
-    echo "  Then re-run this script with --native."
-    exit 1
+  if $FORCE_BUILD; then
+    info "Mode: ${BOLD}Native Build (from source)${NC}  (arch: ${ARCH})"
+  else
+    info "Mode: ${BOLD}Native Install (pre-built binary)${NC}  (arch: ${ARCH})"
   fi
-  success "cargo OK  ($(cargo --version))"
 
-  info "Installing build dependencies via apt…"
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq \
-    build-essential \
-    pkg-config \
-    libgstreamer1.0-dev \
-    libgstreamer-plugins-base1.0-dev \
-    libdbus-1-dev
-  success "Build dependencies installed"
+  # URL of the pre-built binary published by the GitHub Actions release workflow
+  RELEASE_URL="https://github.com/nicolasasauer/nicocast-v2/releases/latest/download/nicocast-aarch64"
 
   # ===========================================================================
-  # Native Step 2/6 — Build with cargo
+  # Native Step 1/5 — Obtain the nicocast binary
   # ===========================================================================
-  step "Step 2/6 — Building nicocast locally with cargo"
-  info "Running: cargo build --release"
-  echo ""
+  step "Step 1/5 — Obtaining nicocast binary"
 
-  cd "$SCRIPT_DIR"
-  cargo build --release \
-    || die "cargo build --release failed. Check the error output above."
+  NATIVE_BINARY="/tmp/nicocast-download-$$"
+  DOWNLOADED=false
 
-  NATIVE_BINARY="$SCRIPT_DIR/target/release/nicocast"
-  success "Binary ready: $NATIVE_BINARY  ($(du -sh "$NATIVE_BINARY" | cut -f1))"
+  if ! $FORCE_BUILD; then
+    info "Downloading pre-built binary from GitHub Releases…"
+    if curl -fsSL --max-time 120 -o "$NATIVE_BINARY" "$RELEASE_URL"; then
+      chmod +x "$NATIVE_BINARY"
+      DOWNLOADED=true
+      success "Downloaded pre-built binary  ($(du -sh "$NATIVE_BINARY" | cut -f1))"
+    else
+      warn "Download failed — falling back to building from source."
+    fi
+  fi
+
+  if ! $DOWNLOADED; then
+    # ── Check cargo ──────────────────────────────────────────────────────────
+    if ! command -v cargo &>/dev/null; then
+      echo ""
+      error "cargo (Rust) is not installed."
+      echo ""
+      echo "  Install Rust via rustup:"
+      echo ""
+      echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+      echo "    source \$HOME/.cargo/env"
+      echo ""
+      echo "  Then re-run this script.  Alternatively, wait for a GitHub Actions"
+      echo "  release build and re-run without --build to download it instead."
+      exit 1
+    fi
+    success "cargo OK  ($(cargo --version))"
+
+    info "Installing build dependencies via apt…"
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq \
+      build-essential \
+      pkg-config \
+      libgstreamer1.0-dev \
+      libgstreamer-plugins-base1.0-dev \
+      libdbus-1-dev
+    success "Build dependencies installed"
+
+    info "Running: cargo build --release"
+    echo ""
+    cd "$SCRIPT_DIR"
+    cargo build --release \
+      || die "cargo build --release failed. Check the error output above."
+
+    NATIVE_BINARY="$SCRIPT_DIR/target/release/nicocast"
+    success "Binary ready: $NATIVE_BINARY  ($(du -sh "$NATIVE_BINARY" | cut -f1))"
+  fi
 
   # ===========================================================================
-  # Native Step 3/6 — Install binary and config
+  # Native Step 2/5 — Install binary and config
   # ===========================================================================
-  step "Step 3/6 — Installing binary and config"
+  step "Step 2/5 — Installing binary and config"
 
   $SUDO mkdir -p /etc/nicocast /usr/local/bin
   $SUDO cp "$NATIVE_BINARY" /usr/local/bin/nicocast
@@ -190,9 +221,9 @@ if $NATIVE_MODE; then
   success "Config installed at /etc/nicocast/config.toml"
 
   # ===========================================================================
-  # Native Step 4/6 — Install GStreamer runtime dependencies
+  # Native Step 3/5 — Install GStreamer runtime dependencies
   # ===========================================================================
-  step "Step 4/6 — Installing GStreamer runtime dependencies"
+  step "Step 3/5 — Installing GStreamer runtime dependencies"
   info "This requires internet access and may take a minute…"
 
   $SUDO apt-get update -qq
@@ -204,9 +235,9 @@ if $NATIVE_MODE; then
   success "GStreamer dependencies installed"
 
   # ===========================================================================
-  # Native Step 5/6 — systemd service + log rotation
+  # Native Step 4/5 — systemd service + log rotation
   # ===========================================================================
-  step "Step 5/6 — Creating systemd service and log rotation"
+  step "Step 4/5 — Creating systemd service and log rotation"
 
   $SUDO tee /etc/systemd/system/nicocast.service > /dev/null <<'SERVICE'
 [Unit]
@@ -247,9 +278,9 @@ LOGROTATE
   success "Log rotation configured (/etc/logrotate.d/nicocast)"
 
   # ===========================================================================
-  # Native Step 6/6 — USB Ethernet Gadget
+  # Native Step 5/5 — USB Ethernet Gadget
   # ===========================================================================
-  step "Step 6/6 — Configuring USB Ethernet Gadget (usb0)"
+  step "Step 5/5 — Configuring USB Ethernet Gadget (usb0)"
   info "Enables persistent SSH/log access on 192.168.7.2, independent of WiFi."
 
   NATIVE_GADGET_CHANGED=0

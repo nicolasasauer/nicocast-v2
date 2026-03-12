@@ -1,0 +1,97 @@
+# =============================================================================
+# build.yml — nicocast-v2 CI/CD pipeline
+#
+# Cross-compiles the nicocast binary for Raspberry Pi Zero 2W (aarch64) using
+# the existing Dockerfile and publishes a GitHub Release so the Pi can
+# download the binary directly with ./setup.sh.
+#
+# Triggers:
+#   push → main     builds binary, uploads artifact, updates rolling "latest"
+#                   pre-release (download URL stays stable across commits)
+#   push → v*.*.*   builds binary, creates a proper versioned GitHub Release
+#   pull_request     builds binary only (no release, validates the build)
+# =============================================================================
+
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    # Trigger on strict semver tags only (e.g. v1.0.0, v2.3.1).
+    # Pre-release suffixes (v1.0.0-beta.1) are NOT matched here — push to main
+    # to update the rolling "latest" pre-release instead.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write   # required to create/update GitHub Releases
+
+jobs:
+  build:
+    name: Cross-compile for aarch64 (Raspberry Pi Zero 2W)
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Cross-compile via Docker ──────────────────────────────────────────
+      # Uses the existing multi-stage Dockerfile which installs a Debian arm64
+      # cross-toolchain, cross-compiles with -C target-cpu=cortex-a53, and
+      # verifies the output is a valid aarch64 ELF.
+      - name: Build aarch64 binary via Docker
+        run: |
+          docker build --platform linux/amd64 -t nicocast:latest .
+          docker create --name nc_tmp nicocast:latest
+          docker cp nc_tmp:/usr/local/bin/nicocast ./nicocast-aarch64
+          docker rm nc_tmp
+          chmod +x nicocast-aarch64
+          echo "Binary size: $(du -sh nicocast-aarch64 | cut -f1)"
+          file nicocast-aarch64
+
+      # ── 3. Upload artifact (all branches / PRs) ───────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nicocast-aarch64
+          path: nicocast-aarch64
+          retention-days: 30
+
+      # ── 4a. Rolling "latest" pre-release (main branch only) ──────────────────
+      # Deletes and recreates the "latest" release so the download URL
+      #   https://github.com/.../releases/latest/download/nicocast-aarch64
+      # always points to the most recent build from main.
+      - name: Publish rolling "latest" pre-release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Remove any existing "latest" release and its tag cleanly
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create latest \
+            --title "latest ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+            --notes "Automatically built from the latest commit on \`main\` ($(git rev-parse --short HEAD)).
+
+          Install on Raspberry Pi Zero 2W:
+          \`\`\`bash
+          git clone https://github.com/${{ github.repository }}.git
+          cd nicocast-v2
+          ./setup.sh
+          \`\`\`
+          " \
+            --prerelease \
+            nicocast-aarch64
+
+      # ── 4b. Versioned release (on semver tag, e.g. v1.0.0) ───────────────────
+      - name: Create versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "nicocast $GITHUB_REF_NAME" \
+            --generate-notes \
+            nicocast-aarch64
