@@ -1,6 +1,9 @@
 # Cargo build artefacts (can be rebuilt from source at any time)
 /target/
 
+# Cross-compiled binary extracted by setup.sh (reproducible build artifact)
+/nicocast-aarch64
+
 # Cargo credentials (never commit)
 .cargo/credentials.toml
 
