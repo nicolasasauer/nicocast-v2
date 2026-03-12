@@ -10,7 +10,8 @@
 #   2. Installs the binary to /usr/local/bin and config to /etc/nicocast
 #   3. Installs GStreamer runtime dependencies via apt
 #   4. Creates and enables the nicocast systemd service (auto-starts at boot)
-#   5. Configures USB Ethernet Gadget (usb0) for persistent SSH/log access
+#   5. Installs the status monitor script and its systemd service
+#   6. Configures USB Ethernet Gadget (usb0) for persistent SSH/log access
 #
 #   Docker mode (default on x86_64 — cross-compiles and deploys over SSH):
 #   1. Builds the nicocast binary via Docker (cross-compilation for aarch64)
@@ -18,7 +19,8 @@
 #   3. Installs GStreamer runtime dependencies on the Pi
 #   4. Creates and enables the nicocast systemd service
 #   5. Configures log rotation
-#   6. Enables the USB Ethernet Gadget (usb0) for persistent log access
+#   6. Deploys the status monitor script and its systemd service
+#   7. Enables the USB Ethernet Gadget (usb0) for persistent log access
 #
 # Requirements (Native mode, run on the Pi itself):
 #   - curl (pre-installed on Raspberry Pi OS)
@@ -244,9 +246,9 @@ if $NATIVE_MODE; then
   success "Config installed at /etc/nicocast/config.toml"
 
   # ===========================================================================
-  # Native Step 3/5 — Install GStreamer runtime dependencies
+  # Native Step 3/6 — Install GStreamer runtime dependencies
   # ===========================================================================
-  step "Step 3/5 — Installing GStreamer runtime dependencies"
+  step "Step 3/6 — Installing GStreamer runtime dependencies"
   info "This requires internet access and may take a minute…"
 
   apt_get_update
@@ -258,9 +260,9 @@ if $NATIVE_MODE; then
   success "GStreamer dependencies installed"
 
   # ===========================================================================
-  # Native Step 4/5 — systemd service + log rotation
+  # Native Step 4/6 — systemd service + log rotation
   # ===========================================================================
-  step "Step 4/5 — Creating systemd service and log rotation"
+  step "Step 4/6 — Creating systemd service and log rotation"
 
   $SUDO tee /etc/systemd/system/nicocast.service > /dev/null <<'SERVICE'
 [Unit]
@@ -302,9 +304,32 @@ LOGROTATE
   success "Log rotation configured (/etc/logrotate.d/nicocast)"
 
   # ===========================================================================
-  # Native Step 5/5 — USB Ethernet Gadget
+  # Native Step 5/6 — Status monitor (HDMI framebuffer)
   # ===========================================================================
-  step "Step 5/5 — Configuring USB Ethernet Gadget (usb0)"
+  step "Step 5/6 — Installing NicoCast status monitor"
+  info "Displays Bereit / Verbinde… / Streaming on the HDMI output via fbi."
+
+  # Install Pillow (PIL) and fbi
+  apt_get_update
+  $SUDO apt-get install -y -qq python3-pil fbi
+
+  # Copy the status monitor script
+  $SUDO cp "$SCRIPT_DIR/status_monitor/nicocast_status.py" /usr/local/bin/nicocast_status.py
+  $SUDO chmod +x /usr/local/bin/nicocast_status.py
+
+  # Install the systemd unit
+  $SUDO cp "$SCRIPT_DIR/status_monitor/nicocast-status.service" \
+    /etc/systemd/system/nicocast-status.service
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable nicocast-status
+
+  success "Status monitor installed at /usr/local/bin/nicocast_status.py"
+  success "nicocast-status service enabled (auto-starts at boot)"
+
+  # ===========================================================================
+  # Native Step 6/6 — USB Ethernet Gadget
+  # ===========================================================================
+  step "Step 6/6 — Configuring USB Ethernet Gadget (usb0)"
   info "Enables persistent SSH/log access on 192.168.7.2, independent of WiFi."
 
   NATIVE_GADGET_CHANGED=0
@@ -367,11 +392,13 @@ LOGROTATE
   echo -e "  ${BOLD}Start nicocast:${NC}"
   echo ""
   echo "    sudo systemctl start nicocast"
+  echo "    sudo systemctl start nicocast-status"
   echo ""
 
   echo -e "  ${BOLD}Follow live logs:${NC}"
   echo ""
   echo "    sudo journalctl -u nicocast -f"
+  echo "    sudo journalctl -u nicocast-status -f"
   echo ""
   echo "  See README.md for the full configuration reference and troubleshooting guide."
   echo ""
@@ -461,7 +488,7 @@ success "Config installed at /etc/nicocast/config.toml"
 # =============================================================================
 # Step 5 — Install GStreamer runtime dependencies
 # =============================================================================
-step "Step 5/7 — Installing GStreamer runtime dependencies"
+step "Step 5/8 — Installing GStreamer runtime dependencies"
 info "This requires internet access on the Pi and may take a minute…"
 
 ssh "$PI_HOST" bash <<'REMOTE'
@@ -480,7 +507,9 @@ done
 sudo apt-get install -y -qq \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
-  gstreamer1.0-tools
+  gstreamer1.0-tools \
+  python3-pil \
+  fbi
 REMOTE
 
 success "GStreamer dependencies installed"
@@ -488,7 +517,7 @@ success "GStreamer dependencies installed"
 # =============================================================================
 # Step 6 — systemd service + log rotation
 # =============================================================================
-step "Step 6/7 — Creating systemd service and log rotation"
+step "Step 6/8 — Creating systemd service and log rotation"
 
 ssh "$PI_HOST" bash <<'REMOTE'
 set -euo pipefail
@@ -536,9 +565,31 @@ success "systemd service enabled (auto-starts at boot)"
 success "Log rotation configured (/etc/logrotate.d/nicocast)"
 
 # =============================================================================
-# Step 7 — USB Ethernet Gadget
+# Step 7 — Status monitor (HDMI framebuffer)
 # =============================================================================
-step "Step 7/7 — Configuring USB Ethernet Gadget (usb0)"
+step "Step 7/8 — Deploying NicoCast status monitor"
+info "Displays Bereit / Verbinde… / Streaming on the HDMI output via fbi."
+
+scp -q "$SCRIPT_DIR/status_monitor/nicocast_status.py" "${PI_HOST}:/tmp/nicocast_status.py"
+scp -q "$SCRIPT_DIR/status_monitor/nicocast-status.service" \
+  "${PI_HOST}:/tmp/nicocast-status.service"
+
+ssh "$PI_HOST" bash <<'REMOTE'
+set -euo pipefail
+sudo mv /tmp/nicocast_status.py /usr/local/bin/nicocast_status.py
+sudo chmod +x /usr/local/bin/nicocast_status.py
+sudo mv /tmp/nicocast-status.service /etc/systemd/system/nicocast-status.service
+sudo systemctl daemon-reload
+sudo systemctl enable nicocast-status
+REMOTE
+
+success "Status monitor installed at /usr/local/bin/nicocast_status.py"
+success "nicocast-status service enabled (auto-starts at boot)"
+
+# =============================================================================
+# Step 8 — USB Ethernet Gadget
+# =============================================================================
+step "Step 8/8 — Configuring USB Ethernet Gadget (usb0)"
 info "Enables persistent SSH/log access on 192.168.7.2, independent of WiFi."
 
 # Capture what changed on the Pi so we know if a reboot is needed
@@ -629,6 +680,7 @@ echo ""
 echo -e "  ${BOLD}Start nicocast:${NC}"
 echo ""
 echo "    ssh pi@192.168.7.2 'sudo systemctl start nicocast'"
+echo "    ssh pi@192.168.7.2 'sudo systemctl start nicocast-status'"
 echo ""
 
 echo -e "  ${BOLD}Follow live logs:${NC}"
@@ -636,6 +688,7 @@ echo ""
 echo "    ./setup.sh --logs pi@192.168.7.2"
 echo "    # or directly via SSH:"
 echo "    ssh pi@192.168.7.2 'sudo journalctl -u nicocast -f'"
+echo "    ssh pi@192.168.7.2 'sudo journalctl -u nicocast-status -f'"
 echo ""
 echo "  See README.md for the full configuration reference and troubleshooting guide."
 echo ""

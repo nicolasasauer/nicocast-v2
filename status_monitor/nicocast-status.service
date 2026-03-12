@@ -1,0 +1,21 @@
+[Unit]
+Description=NicoCast Status Monitor (HDMI framebuffer)
+Documentation=https://github.com/nicolasasauer/nicocast-v2
+# Start after nicocast so the log file is created first; but do not
+# require it — the monitor waits for the file to appear on its own.
+After=nicocast.service
+Wants=nicocast.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/nicocast_status.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nicocast-status
+# Give fbi access to the framebuffer device
+# (the service runs as root via systemd, so this is already satisfied by
+#  default; adjust User= and supplementary groups if you run as a regular user)
+
+[Install]
+WantedBy=multi-user.target

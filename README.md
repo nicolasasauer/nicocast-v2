@@ -430,6 +430,50 @@ sudo journalctl -u nicocast -f
 
 ---
 
+## HDMI Status Monitor
+
+The `status_monitor/` directory contains a small Python script that watches the
+NicoCast log and displays the current Miracast state as a full-screen graphic on
+the HDMI output of the Raspberry Pi.
+
+### States
+
+| Display text | Meaning |
+|---|---|
+| **Bereit** (green) | P2P discovery active — waiting for a Miracast source |
+| **Verbinde…** (amber) | RTSP session in progress — source connected, negotiating |
+| **Streaming** (blue) | GStreamer pipeline active — video is playing |
+
+The image also shows the device name (`NicoCast-Sink`) and the current IP
+addresses of `usb0` and `wlan0`.
+
+### Requirements
+
+```bash
+sudo apt-get install python3-pil fbi
+```
+
+### Manual installation
+
+> **Recommended:** use `./setup.sh` — it installs and enables the service automatically.
+
+```bash
+# Copy the script
+sudo cp status_monitor/nicocast_status.py /usr/local/bin/nicocast_status.py
+sudo chmod +x /usr/local/bin/nicocast_status.py
+
+# Install and enable the systemd service
+sudo cp status_monitor/nicocast-status.service \
+  /etc/systemd/system/nicocast-status.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now nicocast-status
+
+# Follow its logs
+sudo journalctl -u nicocast-status -f
+```
+
+---
+
 ## Configuration Reference
 
 All settings live in `config.toml`.  The binary searches these paths **in
