@@ -148,8 +148,12 @@ if $NATIVE_MODE; then
     info "Mode: ${BOLD}Native Install (pre-built binary)${NC}  (arch: ${ARCH})"
   fi
 
-  # URL of the pre-built binary published by the GitHub Actions release workflow
-  RELEASE_URL="https://github.com/nicolasasauer/nicocast-v2/releases/latest/download/nicocast-aarch64"
+  # URL of the pre-built binary published by the GitHub Actions release workflow.
+  # Uses the direct tag-based path (/releases/download/<tag>/) rather than the
+  # /releases/latest/download/ redirect, because the rolling "latest" release is
+  # published as a pre-release and GitHub's /releases/latest redirect only resolves
+  # to non-prerelease releases (causing a 404 otherwise).
+  RELEASE_URL="https://github.com/nicolasasauer/nicocast-v2/releases/download/latest/nicocast-aarch64"
 
   # ===========================================================================
   # Native Step 1/5 — Obtain the nicocast binary
