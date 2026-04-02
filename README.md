@@ -494,10 +494,87 @@ field is optional.
 | `rtsp_port` | `7236` | RTSP control-plane port (Miracast spec) |
 | `rtp_port` | `16384` | UDP port for incoming RTP/MPEG-TS payload |
 | `log_file` | `"/var/log/miracast_rs.log"` | Persistent log destination |
+| `health_port` | `8080` | TCP port for the HTTP health endpoint (`GET /health`); set to `0` to disable |
+| `rtsp_keepalive_secs` | `60` | Seconds of RTSP inactivity before the connection is torn down (0 = no timeout) |
+| `rtsp_send_m2` | `false` | Send a sink-initiated M2 `GET_PARAMETER` after responding to M1 `OPTIONS` (required by some Samsung firmware versions) |
+| `airplay_enabled` | `false` | Spawn `uxplay` as a supervised child process to add AirPlay (iPhone / iPad) support |
+| `airplay_name` | `"NicoCast-AirPlay"` | Name advertised by UxPlay over mDNS (shown in iPhone Control Centre) |
 | `p2p.wps_dev_type` | `"7-0050F204-1"` | WPS Primary Device Type (Display / TV) |
 | `p2p.no_group_iface` | `false` | Corresponds to `p2p_no_group_iface=0` |
 | `p2p.wfd_subelems` | `"000600111c4400c8"` | WFD IE subelements (hex) |
 | `p2p.listen_secs` | `300` | P2P listen window duration in seconds |
+| `p2p.connect_retries` | `5` | Maximum number of attempts to connect to wpa_supplicant on D-Bus |
+| `p2p.connect_retry_secs` | `2` | Seconds to wait between successive wpa_supplicant connection attempts |
+
+---
+
+## HTTP Health Endpoint
+
+NicoCast exposes a minimal HTTP endpoint for runtime status monitoring.
+
+```
+GET /health  →  200 OK
+
+{"p2p":1,"p2p_label":"discovering","rtsp":0,"rtsp_label":"idle","video":0,"video_label":"idle"}
+```
+
+### State codes
+
+| Code | Label | Meaning |
+|---|---|---|
+| `0` | `idle` | Subsystem inactive / not yet started |
+| `1` | `discovering` | P2P discovery active |
+| `2` | `connected` | RTSP session established |
+| `3` | `playing` | Streaming / GStreamer pipeline running |
+
+The endpoint listens on **port 8080** by default.  Set `health_port = 0` in
+`config.toml` to disable it entirely.
+
+```bash
+# Quick check from the Pi or from your laptop (via USB Ethernet)
+curl http://192.168.7.2:8080/health
+```
+
+---
+
+## AirPlay (iPhone / iPad)
+
+NicoCast can receive AirPlay streams from iPhones and iPads in addition to
+Miracast, by managing [`uxplay`](https://github.com/FDH2/UxPlay) as a supervised
+child process.
+
+### Enable AirPlay
+
+1. Install `uxplay` on the Raspberry Pi:
+
+   ```bash
+   sudo apt install uxplay
+   ```
+
+   > `setup.sh` installs `uxplay` automatically when `airplay_enabled = true`
+   > is set before running it.
+
+2. Add the following to `/etc/nicocast/config.toml`:
+
+   ```toml
+   airplay_enabled = true
+   airplay_name    = "NicoCast-AirPlay"   # shown in iPhone Control Centre
+   ```
+
+3. Restart the service:
+
+   ```bash
+   sudo systemctl restart nicocast
+   ```
+
+NicoCast restarts `uxplay` automatically if it exits unexpectedly (5-second
+delay between attempts).
+
+### Network interface limitation
+
+`wlan0` cannot be in P2P mode (Miracast) and in normal station/AP mode
+(AirPlay) at the same time.  If you need both protocols simultaneously, use a
+second wireless interface.
 
 ---
 
