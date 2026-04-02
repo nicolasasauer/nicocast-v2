@@ -279,7 +279,9 @@ impl P2pManager {
         conn: &Connection,
         cfg: &Config,
     ) -> Result<zbus::zvariant::OwnedObjectPath> {
-        let max_retries = cfg.p2p.connect_retries.max(1);
+        // `connect_retries = 0` means no attempts are made and the
+        // function returns an error immediately.
+        let max_retries = cfg.p2p.connect_retries;
         let retry_delay = cfg.p2p.connect_retry_secs;
         let mut last_err: Option<anyhow::Error> = None;
 

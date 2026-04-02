@@ -264,8 +264,8 @@ fn make_h264_decoder() -> Result<Element> {
         return Ok(el);
     }
     info!(
-        "v4l2h264dec not available — falling back to software decoder avdec_h264. \
-         Install gstreamer1.0-libav on the target if avdec_h264 is also missing."
+        "v4l2h264dec not available — trying software decoder avdec_h264 \
+         (install gstreamer1.0-libav if also missing)"
     );
     make_element("avdec_h264", "decode")
 }

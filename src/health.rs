@@ -117,7 +117,11 @@ pub async fn serve(port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     // Read the first chunk — we only need the first line.
-                    let _ = stream.read(&mut buf).await;
+                    // On error or empty read (connection closed), close silently.
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
                     let first_line = std::str::from_utf8(&buf)
                         .unwrap_or("")
                         .lines()

@@ -152,14 +152,18 @@ async fn handle_connection(
         };
 
         // Determine how many body bytes we need to read.
+        // Cap the declared Content-Length to `MAX_MSG_BYTES` to prevent a
+        // malicious (or malformed) client from causing integer overflow or
+        // an unbounded read via an extremely large value.
         let content_length: usize = raw[..header_end]
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
             .and_then(|l| l.split_once(':'))
-            .and_then(|(_, v)| v.trim().parse().ok())
-            .unwrap_or(0);
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(MAX_MSG_BYTES);
 
-        let total_msg_len = header_end + content_length;
+        let total_msg_len = header_end.saturating_add(content_length);
 
         // Keep reading until we have both the header and the full body.
         if buf.len() < total_msg_len {
