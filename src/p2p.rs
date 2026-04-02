@@ -38,19 +38,16 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::sync::{atomic::Ordering, Arc};
 use tracing::{debug, info, warn};
 use zbus::{proxy, Connection};
 use zvariant::OwnedValue;
 
 use crate::config::Config;
+use crate::health::{AppState, STATE_IDLE, STATE_P2P_DISCOVERING};
 
 // ─── tunables ────────────────────────────────────────────────────────────────
 
-/// How many times to retry the initial wpa_supplicant D-Bus handshake before
-/// giving up.  Each failed attempt is separated by `WPA_INIT_RETRY_DELAY_SECS`.
-const WPA_INIT_MAX_RETRIES: u32 = 5;
-/// Seconds to wait between successive wpa_supplicant connection attempts.
-const WPA_INIT_RETRY_DELAY_SECS: u64 = 2;
 
 // ─── D-Bus proxy definitions ─────────────────────────────────────────────────
 
@@ -276,15 +273,17 @@ impl P2pManager {
     }
 
     /// Attempt to obtain the wpa_supplicant D-Bus object path for the
-    /// configured interface, retrying up to [`WPA_INIT_MAX_RETRIES`] times to
+    /// configured interface, retrying up to `cfg.p2p.connect_retries` times to
     /// tolerate a slow wpa_supplicant startup.
     async fn get_or_create_interface(
         conn: &Connection,
         cfg: &Config,
     ) -> Result<zbus::zvariant::OwnedObjectPath> {
+        let max_retries = cfg.p2p.connect_retries.max(1);
+        let retry_delay = cfg.p2p.connect_retry_secs;
         let mut last_err: Option<anyhow::Error> = None;
 
-        for attempt in 1..=WPA_INIT_MAX_RETRIES {
+        for attempt in 1..=max_retries {
             let wpa = match WpaSupplicantProxy::new(conn).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -292,14 +291,12 @@ impl P2pManager {
                         .context("creating WpaSupplicant proxy (fi.w1.wpa_supplicant1)");
                     warn!(
                         "wpa_supplicant proxy not yet available \
-                         (attempt {attempt}/{WPA_INIT_MAX_RETRIES}): {err}"
+                         (attempt {attempt}/{max_retries}): {err}"
                     );
                     last_err = Some(err);
-                    if attempt < WPA_INIT_MAX_RETRIES {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(
-                            WPA_INIT_RETRY_DELAY_SECS,
-                        ))
-                        .await;
+                    if attempt < max_retries {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay))
+                            .await;
                     }
                     continue;
                 }
@@ -336,25 +333,22 @@ impl P2pManager {
                     }
 
                     let err = anyhow::Error::from(get_err).context(format!(
-                        "GetInterface('{}') failed (attempt {attempt}/{WPA_INIT_MAX_RETRIES})",
+                        "GetInterface('{}') failed (attempt {attempt}/{max_retries})",
                         cfg.wifi_interface
                     ));
-                    warn!("{err}; retrying in {WPA_INIT_RETRY_DELAY_SECS}s");
+                    warn!("{err}; retrying in {retry_delay}s");
                     last_err = Some(err);
                 }
             }
 
-            if attempt < WPA_INIT_MAX_RETRIES {
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    WPA_INIT_RETRY_DELAY_SECS,
-                ))
-                .await;
+            if attempt < max_retries {
+                tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay)).await;
             }
         }
 
         Err(last_err.unwrap_or_else(|| {
             anyhow::anyhow!(
-                "wpa_supplicant did not respond after {WPA_INIT_MAX_RETRIES} attempts"
+                "wpa_supplicant did not respond after {max_retries} attempts"
             )
         }))
     }
@@ -463,25 +457,59 @@ impl P2pManager {
     }
 
     /// Configure WFD IEs and P2PDeviceConfig, then enter the discovery loop.
-    pub async fn run(&mut self) -> Result<()> {
-        self.configure_wfd_ies().await;
-        self.configure_p2p_device_config().await?;
-        self.start_discovery().await?;
+    ///
+    /// This method runs indefinitely.  If the initial configuration or
+    /// discovery-start fails it logs a warning and retries after
+    /// `cfg.p2p.connect_retry_secs` seconds.  After each `cfg.p2p.listen_secs`
+    /// interval it re-issues `P2PDevice.Find` + `Listen` to keep the device
+    /// discoverable without relying on systemd restarts.
+    pub async fn run(&mut self, state: Arc<AppState>) -> Result<()> {
+        let retry_delay = tokio::time::Duration::from_secs(self.cfg.p2p.connect_retry_secs);
 
-        info!(
-            "P2P manager active — discoverable as '{}' ({})",
-            self.cfg.device_name, self.cfg.p2p.wps_dev_type
-        );
-
-        // Refresh the listen window before wpa_supplicant's timeout expires.
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                self.cfg.p2p.listen_secs as u64,
-            ))
-            .await;
-            debug!("Refreshing P2P listen window");
+            self.configure_wfd_ies().await;
+
+            if let Err(e) = self.configure_p2p_device_config().await {
+                warn!(
+                    "P2P device config failed: {e:#}; \
+                     retrying in {}s",
+                    self.cfg.p2p.connect_retry_secs
+                );
+                tokio::time::sleep(retry_delay).await;
+                continue;
+            }
+
             if let Err(e) = self.start_discovery().await {
-                warn!("Failed to refresh P2P discovery: {e}");
+                warn!(
+                    "P2P discovery start failed: {e:#}; \
+                     retrying in {}s",
+                    self.cfg.p2p.connect_retry_secs
+                );
+                tokio::time::sleep(retry_delay).await;
+                continue;
+            }
+
+            state.p2p.store(STATE_P2P_DISCOVERING, Ordering::Relaxed);
+            info!(
+                "P2P manager active — discoverable as '{}' ({})",
+                self.cfg.device_name, self.cfg.p2p.wps_dev_type
+            );
+
+            // Refresh the listen window before wpa_supplicant's timeout expires.
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    self.cfg.p2p.listen_secs as u64,
+                ))
+                .await;
+                debug!("Refreshing P2P listen window");
+                if let Err(e) = self.start_discovery().await {
+                    warn!(
+                        "Failed to refresh P2P discovery: {e}; \
+                         restarting P2P configuration"
+                    );
+                    state.p2p.store(STATE_IDLE, Ordering::Relaxed);
+                    break; // break inner → outer loop retries configuration
+                }
             }
         }
     }
