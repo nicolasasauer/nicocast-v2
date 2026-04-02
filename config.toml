@@ -39,8 +39,8 @@ no_group_iface = false
 # WFD Information Element subelements (hex-encoded) injected into P2P beacons.
 #
 # Byte layout (subelement 0x00 — WFD Device Information, 6 bytes):
-#   00        subelement ID  = 0x00 (Device Info)
-#   0006      length         = 6 bytes
+#   00        subelement ID  = 0x00 (Device Info)   [1 byte]
+#   06        length         = 6 bytes              [1 byte]
 #   0011      device info    = 0x0011
 #               bits 1:0 = 01  → Primary Sink
 #               bit  4   =  1  → WFD Session Available

@@ -110,6 +110,8 @@ async fn handle_connection(
     let mut buf = BytesMut::with_capacity(4096);
     let mut session_id: Option<String> = None;
     let mut sent_m2 = false;
+    // Counter for CSeq headers on sink-initiated requests (RFC 2326 §12.17).
+    let mut sink_cseq: u32 = 1;
     let keepalive = tokio::time::Duration::from_secs(keepalive_secs);
 
     loop {
@@ -200,10 +202,11 @@ async fn handle_connection(
         if request.method == "OPTIONS" && send_m2 && !sent_m2 {
             sent_m2 = true;
             if let Err(e) =
-                send_m2_get_parameter(&mut stream, &mut buf, keepalive_secs).await
+                send_m2_get_parameter(&mut stream, &mut buf, keepalive_secs, sink_cseq).await
             {
                 warn!("RTSP: M2 GET_PARAMETER failed: {e:#}");
             }
+            sink_cseq = sink_cseq.wrapping_add(1);
         }
     }
 }
@@ -215,10 +218,15 @@ async fn handle_connection(
 ///
 /// This optional exchange is required by some Samsung firmware versions and
 /// is enabled via `rtsp_send_m2 = true` in `config.toml`.
+///
+/// `cseq` is the caller's sink-side sequence counter; it must be incremented
+/// after each sink-initiated request so that CSeq values are ascending and
+/// unique as required by RFC 2326 §12.17.
 async fn send_m2_get_parameter(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
     keepalive_secs: u64,
+    cseq: u32,
 ) -> Result<()> {
     let local_addr = stream
         .local_addr()
@@ -228,7 +236,7 @@ async fn send_m2_get_parameter(
     let body = "wfd_video_formats\r\nwfd_audio_codecs\r\nwfd_client_rtp_ports\r\n";
     let m2_req = format!(
         "GET_PARAMETER {uri} {RTSP_VERSION}{CRLF}\
-         CSeq: 2{CRLF}\
+         CSeq: {cseq}{CRLF}\
          Content-Type: text/parameters{CRLF}\
          Content-Length: {}{CRLF}\
          {CRLF}\
