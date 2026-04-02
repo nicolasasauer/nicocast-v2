@@ -6,6 +6,10 @@ description = "Miracast Sink (Receiver) for Raspberry Pi Zero 2W with Samsung Sm
 authors = ["nicocast"]
 license = "MIT"
 
+[lib]
+name = "nicocast_v2"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nicocast"
 path = "src/main.rs"

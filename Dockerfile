@@ -101,11 +101,17 @@ COPY Cargo.toml ./
 # fail the build if it is absent.
 COPY Cargo.loc[k] ./
 
-RUN mkdir -p src && printf 'fn main(){}' > src/main.rs \
+RUN mkdir -p src \
+    && printf 'fn main(){}' > src/main.rs \
+    # The [lib] target in Cargo.toml requires src/lib.rs to exist even during
+    # the stub build; an empty file is sufficient for dependency pre-caching.
+    && printf '' > src/lib.rs \
     && cargo build --release --target aarch64-unknown-linux-gnu \
     # Remove only the stub artefacts; keep the compiled deps in the cache.
     && rm -f target/aarch64-unknown-linux-gnu/release/nicocast \
              target/aarch64-unknown-linux-gnu/release/deps/nicocast-* \
+             target/aarch64-unknown-linux-gnu/release/libnicocast_v2.rlib \
+             target/aarch64-unknown-linux-gnu/release/deps/libnicocast_v2-* \
     && rm -rf src
 
 # ── Build the real application ────────────────────────────────────────────────
@@ -113,7 +119,7 @@ COPY src/      ./src/
 COPY config.toml ./
 
 # `touch` forces cargo to re-link even if timestamps look up-to-date.
-RUN touch src/main.rs \
+RUN touch src/main.rs src/lib.rs \
     && cargo build --release --target aarch64-unknown-linux-gnu
 
 # Confirm the binary is an aarch64 ELF (catches misconfigured cross-linkers).

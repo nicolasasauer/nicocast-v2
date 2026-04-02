@@ -1,14 +1,22 @@
 //! GStreamer hardware-accelerated video pipeline for Miracast on RPi Zero 2W.
 //!
-//! The pipeline receives an MPEG-TS stream over UDP and decodes H.264 using
-//! the Raspberry Pi's V4L2 hardware decoder (`v4l2h264dec`):
+//! The pipeline receives an MPEG-TS stream over UDP and decodes H.264.
+//!
+//! On Raspberry Pi hardware the BCM2710A1 V4L2 codec is used:
 //!
 //! ```text
 //! udpsrc port=<rtp_port>
 //!   → tsdemux          (dynamic pads — H.264 ES linked in pad-added handler)
 //!   → h264parse
-//!   → v4l2h264dec      ← BCM2710A1 hardware decode
+//!   → v4l2h264dec      ← BCM2710A1 hardware decode (preferred)
 //!   → autovideosink
+//! ```
+//!
+//! On machines without `v4l2h264dec` (e.g. a development laptop) the pipeline
+//! automatically falls back to the software decoder:
+//!
+//! ```text
+//! udpsrc → tsdemux → h264parse → avdec_h264 → autovideosink
 //! ```
 //!
 //! # gstreamer-rs 0.25 compatibility notes
@@ -26,9 +34,11 @@ use gstreamer::{
     prelude::*,
     ClockTime, Element, ElementFactory, MessageView, Pipeline, State,
 };
+use std::sync::{atomic::Ordering, Arc};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::health::{AppState, STATE_IDLE, STATE_PLAYING};
 
 // ─── drop-safe pipeline guard ─────────────────────────────────────────────────
 
@@ -47,7 +57,9 @@ impl Drop for PipelineGuard {
 ///
 /// Blocks inside the async executor (via `yield_now`) until the pipeline
 /// reaches EOS, encounters an unrecoverable error, or the process exits.
-pub async fn run_pipeline(cfg: &Config) -> Result<()> {
+/// Updates `state.video` with [`STATE_PLAYING`] when streaming begins and
+/// resets it to [`STATE_IDLE`] when the pipeline stops.
+pub async fn run_pipeline(cfg: &Config, state: Arc<AppState>) -> Result<()> {
     let pipeline = build_pipeline(cfg).context("building GStreamer pipeline")?;
 
     info!(
@@ -59,6 +71,7 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
         .set_state(State::Playing)
         .context("setting pipeline to PLAYING")?;
     info!("GStreamer pipeline PLAYING");
+    state.video.store(STATE_PLAYING, Ordering::Relaxed);
 
     // PipelineGuard ensures set_state(Null) is called even if this task is
     // aborted or cancelled before the loop reaches its normal exit.
@@ -124,6 +137,7 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
         .0
         .set_state(State::Null)
         .context("stopping GStreamer pipeline")?;
+    state.video.store(STATE_IDLE, Ordering::Relaxed);
     info!("GStreamer pipeline stopped (exit reason: {exit_reason})");
     Ok(())
 }
@@ -132,8 +146,10 @@ pub async fn run_pipeline(cfg: &Config) -> Result<()> {
 
 /// Construct the element graph:
 ///
-/// `udpsrc → tsdemux ⟿ h264parse → v4l2h264dec → autovideosink`
+/// `udpsrc → tsdemux ⟿ h264parse → <h264dec> → autovideosink`
 ///
+/// The `<h264dec>` is `v4l2h264dec` on Raspberry Pi hardware and
+/// `avdec_h264` (libav software) on any other platform.
 /// The `⟿` arrow denotes a dynamic pad connection wired in the
 /// `connect_pad_added` handler.
 fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
@@ -143,7 +159,7 @@ fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
     let udpsrc    = make_element("udpsrc",       "src")?;
     let tsdemux   = make_element("tsdemux",      "demux")?;
     let h264parse = make_element("h264parse",    "parse")?;
-    let v4l2dec   = make_element("v4l2h264dec",  "decode")?;
+    let h264dec   = make_h264_decoder()?;
     let videosink = make_element("autovideosink","sink")?;
 
     // ── configure element properties ─────────────────────────────────────────
@@ -156,15 +172,15 @@ fn build_pipeline(cfg: &Config) -> Result<Pipeline> {
 
     // ── add elements to the pipeline (gstreamer-rs 0.25: pass a slice) ───────
     pipeline
-        .add_many(&[&udpsrc, &tsdemux, &h264parse, &v4l2dec, &videosink])
+        .add_many(&[&udpsrc, &tsdemux, &h264parse, &h264dec, &videosink])
         .context("adding elements to pipeline")?;
 
     // ── static links ──────────────────────────────────────────────────────────
     // udpsrc  →  tsdemux   (static; tsdemux exposes dynamic pads below)
     udpsrc.link(&tsdemux).context("linking udpsrc → tsdemux")?;
-    // h264parse → v4l2h264dec → autovideosink
-    h264parse.link(&v4l2dec).context("linking h264parse → v4l2h264dec")?;
-    v4l2dec.link(&videosink).context("linking v4l2h264dec → autovideosink")?;
+    // h264parse → h264dec → autovideosink
+    h264parse.link(&h264dec).context("linking h264parse → h264dec")?;
+    h264dec.link(&videosink).context("linking h264dec → autovideosink")?;
 
     // ── dynamic pad: tsdemux → h264parse ─────────────────────────────────────
     // tsdemux adds a pad for each elementary stream it finds in the MPEG-TS.
@@ -236,6 +252,24 @@ fn mpeg_ts_caps() -> gstreamer::Caps {
         .build()
 }
 
+/// Select the best available H.264 decoder element.
+///
+/// Prefers `v4l2h264dec` (Raspberry Pi V4L2 hardware codec).  Falls back to
+/// `avdec_h264` (software, from `gstreamer1.0-libav`) on any machine that
+/// does not have the V4L2 codec driver — useful for development and testing
+/// on a regular laptop without Raspberry Pi hardware.
+fn make_h264_decoder() -> Result<Element> {
+    if let Ok(el) = make_element("v4l2h264dec", "decode") {
+        info!("H.264 decoder: using hardware v4l2h264dec");
+        return Ok(el);
+    }
+    info!(
+        "v4l2h264dec not available — trying software decoder avdec_h264 \
+         (install gstreamer1.0-libav if also missing)"
+    );
+    make_element("avdec_h264", "decode")
+}
+
 /// Convenience wrapper: create an element by factory name.
 /// Returns a descriptive error when the plugin is missing.
 fn make_element(factory: &str, name: &str) -> Result<Element> {
@@ -280,5 +314,25 @@ mod tests {
     fn make_element_udpsrc_succeeds() {
         init_gst();
         assert!(make_element("udpsrc", "test_src").is_ok());
+    }
+
+    /// Verifies that `make_h264_decoder` returns *some* element (hardware or
+    /// software) without panicking, as long as at least one H.264 decoder
+    /// plugin is installed.  This test is skipped (passes vacuously) when
+    /// neither decoder is available in the test environment.
+    #[test]
+    fn make_h264_decoder_returns_some_decoder() {
+        init_gst();
+        // If neither v4l2h264dec nor avdec_h264 is installed, skip gracefully.
+        let hw = ElementFactory::find("v4l2h264dec").is_some();
+        let sw = ElementFactory::find("avdec_h264").is_some();
+        if !hw && !sw {
+            eprintln!("Skipping: neither v4l2h264dec nor avdec_h264 available");
+            return;
+        }
+        assert!(
+            make_h264_decoder().is_ok(),
+            "make_h264_decoder must succeed when at least one decoder is installed"
+        );
     }
 }

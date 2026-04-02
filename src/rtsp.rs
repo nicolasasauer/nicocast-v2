@@ -10,6 +10,10 @@
 //! Source → Sink  OPTIONS  *  RTSP/1.0        (M1)
 //! Sink   → Src   200 OK   (Public: …)
 //!
+//! [optional, when rtsp_send_m2 = true]
+//! Sink   → Src   GET_PARAMETER rtsp://…      (M2 – sink-initiated param query)
+//! Src    → Sink  200 OK   (body: wfd parameter values)
+//!
 //! Source → Sink  GET_PARAMETER rtsp://…  (M3 – parameter query)
 //! Sink   → Src   200 OK   (body: wfd parameter list)
 //!
@@ -31,11 +35,13 @@
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;
+use std::sync::{atomic::Ordering, Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::health::{AppState, STATE_IDLE, STATE_PLAYING, STATE_RTSP_CONNECTED};
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
@@ -46,16 +52,29 @@ const MAX_MSG_BYTES: usize = 65_536;
 
 // ─── public entry point ──────────────────────────────────────────────────────
 
-/// Bind the RTSP listener and handle incoming connections.
+/// Bind the RTSP TCP listener on `0.0.0.0:{port}`.
+///
+/// Separating the bind step from [`serve`] lets `main` detect a
+/// port-already-in-use error *before* starting the P2P discovery.  This
+/// ensures the RTSP endpoint is ready to accept connections as soon as
+/// Samsung Smart View discovers the sink.
+pub async fn bind(port: u16) -> Result<TcpListener> {
+    let addr = format!("0.0.0.0:{port}");
+    TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding RTSP listener on {addr}"))
+}
+
+/// Accept and service RTSP connections using a pre-bound listener.
 ///
 /// Each connection is serviced in its own `tokio` task so multiple
 /// sources can connect simultaneously (though Miracast typically uses
 /// a single source at a time).
-pub async fn serve(cfg: &Config) -> Result<()> {
-    let addr = format!("0.0.0.0:{}", cfg.rtsp_port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding RTSP listener on {addr}"))?;
+///
+/// The `state` handle is updated when a session transitions between
+/// connected and playing states.
+pub async fn serve(listener: TcpListener, cfg: &Config, state: Arc<AppState>) -> Result<()> {
+    let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
     info!("RTSP server listening on {addr}");
 
     loop {
@@ -66,8 +85,13 @@ pub async fn serve(cfg: &Config) -> Result<()> {
         info!("RTSP: new connection from {peer}");
 
         let rtp_port = cfg.rtp_port;
+        let keepalive_secs = cfg.rtsp_keepalive_secs;
+        let send_m2 = cfg.rtsp_send_m2;
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, rtp_port).await {
+            if let Err(e) =
+                handle_connection(stream, rtp_port, keepalive_secs, send_m2, state).await
+            {
                 error!("RTSP connection error ({peer}): {e:#}");
             }
         });
@@ -76,19 +100,37 @@ pub async fn serve(cfg: &Config) -> Result<()> {
 
 // ─── connection handler ───────────────────────────────────────────────────────
 
-async fn handle_connection(mut stream: TcpStream, rtp_port: u16) -> Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    rtp_port: u16,
+    keepalive_secs: u64,
+    send_m2: bool,
+    state: Arc<AppState>,
+) -> Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut session_id: Option<String> = None;
+    let mut sent_m2 = false;
+    let keepalive = tokio::time::Duration::from_secs(keepalive_secs);
 
     loop {
-        // Read data from the source
-        let n = stream
-            .read_buf(&mut buf)
-            .await
-            .context("reading from RTSP socket")?;
+        // Apply a keepalive read timeout so dead connections are detected.
+        // Samsung devices send M16 GET_PARAMETER every ~30 s; missing two
+        // consecutive keep-alives (default 60 s) closes the connection.
+        let n = match tokio::time::timeout(keepalive, stream.read_buf(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e).context("reading from RTSP socket"),
+            Err(_) => {
+                warn!(
+                    "RTSP: no data received for {keepalive_secs}s — \
+                     keep-alive timeout, closing connection"
+                );
+                return Ok(());
+            }
+        };
 
         if n == 0 {
             info!("RTSP: connection closed by peer");
+            state.rtsp.store(STATE_IDLE, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -104,13 +146,34 @@ async fn handle_connection(mut stream: TcpStream, rtp_port: u16) -> Result<()> {
             continue;
         }
 
-        let msg_len = match raw.find("\r\n\r\n") {
+        let header_end = match raw.find("\r\n\r\n") {
             Some(idx) => idx + 4,
             None => continue,
         };
 
-        let request_str = raw[..msg_len].to_owned();
-        buf.clear(); // consume the message
+        // Determine how many body bytes we need to read.
+        // Cap the declared Content-Length to `MAX_MSG_BYTES` to prevent a
+        // malicious (or malformed) client from causing integer overflow or
+        // an unbounded read via an extremely large value.
+        let content_length: usize = raw[..header_end]
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split_once(':'))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(MAX_MSG_BYTES);
+
+        let total_msg_len = header_end.saturating_add(content_length);
+
+        // Keep reading until we have both the header and the full body.
+        if buf.len() < total_msg_len {
+            continue;
+        }
+
+        let request_str = std::str::from_utf8(&buf[..total_msg_len])
+            .unwrap_or("")
+            .to_owned();
+        buf.clear(); // consume the complete message
 
         debug!("RTSP ← {}", request_str.trim());
 
@@ -123,13 +186,79 @@ async fn handle_connection(mut stream: TcpStream, rtp_port: u16) -> Result<()> {
         };
 
         let cseq = request.header("CSeq").unwrap_or("0").to_owned();
-        let response = dispatch(&request, &cseq, rtp_port, &mut session_id);
+        let response = dispatch(&request, &cseq, rtp_port, &mut session_id, &state);
 
         debug!("RTSP → {}", response.trim());
         stream
             .write_all(response.as_bytes())
             .await
             .context("writing RTSP response")?;
+
+        // After responding to M1 OPTIONS, optionally send a sink-initiated
+        // M2 GET_PARAMETER to the source.  This is required by some Samsung
+        // firmware versions and is enabled via `rtsp_send_m2 = true`.
+        if request.method == "OPTIONS" && send_m2 && !sent_m2 {
+            sent_m2 = true;
+            if let Err(e) =
+                send_m2_get_parameter(&mut stream, &mut buf, keepalive_secs).await
+            {
+                warn!("RTSP: M2 GET_PARAMETER failed: {e:#}");
+            }
+        }
+    }
+}
+
+// ─── M2 sink-initiated request ────────────────────────────────────────────────
+
+/// Send a sink-initiated M2 `GET_PARAMETER` to the source and read the
+/// response (200 OK expected).
+///
+/// This optional exchange is required by some Samsung firmware versions and
+/// is enabled via `rtsp_send_m2 = true` in `config.toml`.
+async fn send_m2_get_parameter(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    keepalive_secs: u64,
+) -> Result<()> {
+    let local_addr = stream
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "localhost".to_owned());
+    let uri = format!("rtsp://{local_addr}/wfd1.0");
+    let body = "wfd_video_formats\r\nwfd_audio_codecs\r\nwfd_client_rtp_ports\r\n";
+    let m2_req = format!(
+        "GET_PARAMETER {uri} {RTSP_VERSION}{CRLF}\
+         CSeq: 2{CRLF}\
+         Content-Type: text/parameters{CRLF}\
+         Content-Length: {}{CRLF}\
+         {CRLF}\
+         {body}",
+        body.len()
+    );
+
+    debug!("RTSP → M2 GET_PARAMETER (sink-initiated)");
+    stream
+        .write_all(m2_req.as_bytes())
+        .await
+        .context("sending M2 GET_PARAMETER")?;
+
+    // Read and discard the source's response within the keepalive window.
+    let timeout = tokio::time::Duration::from_secs(keepalive_secs.max(10));
+    loop {
+        match tokio::time::timeout(timeout, stream.read_buf(buf)).await {
+            Ok(Ok(0)) => return Ok(()), // connection closed
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e).context("reading M2 response"),
+            Err(_) => {
+                warn!("RTSP: timeout waiting for M2 response");
+                return Ok(());
+            }
+        }
+        if std::str::from_utf8(buf).unwrap_or("").contains("\r\n\r\n") {
+            debug!("RTSP ← M2 response received");
+            buf.clear();
+            return Ok(());
+        }
     }
 }
 
@@ -140,14 +269,27 @@ fn dispatch(
     cseq: &str,
     rtp_port: u16,
     session_id: &mut Option<String>,
+    state: &Arc<AppState>,
 ) -> String {
     match req.method.as_str() {
         "OPTIONS" => handle_options(cseq),
         "GET_PARAMETER" => handle_get_parameter(req, cseq, rtp_port, session_id),
         "SET_PARAMETER" => handle_set_parameter(req, cseq, session_id),
-        "SETUP" => handle_setup(req, cseq, rtp_port, session_id),
-        "PLAY" => handle_play(cseq, session_id),
-        "TEARDOWN" => handle_teardown(cseq, session_id),
+        "SETUP" => {
+            let resp = handle_setup(req, cseq, rtp_port, session_id);
+            state.rtsp.store(STATE_RTSP_CONNECTED, Ordering::Relaxed);
+            resp
+        }
+        "PLAY" => {
+            let resp = handle_play(cseq, session_id);
+            state.rtsp.store(STATE_PLAYING, Ordering::Relaxed);
+            resp
+        }
+        "TEARDOWN" => {
+            let resp = handle_teardown(cseq, session_id);
+            state.rtsp.store(STATE_IDLE, Ordering::Relaxed);
+            resp
+        }
         other => {
             warn!("RTSP: unhandled method '{other}'");
             rtsp_response(cseq, 501, "Not Implemented", None, None)
@@ -382,6 +524,7 @@ fn rtsp_response(
 #[derive(Debug)]
 struct RtspRequest {
     method: String,
+    #[allow(dead_code)]
     uri: String,
     headers: Vec<(String, String)>,
     body: String,
