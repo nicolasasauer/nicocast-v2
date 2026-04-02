@@ -684,6 +684,7 @@ impl P2pManager {
 
     /// Start P2P peer discovery followed by a listen window.
     async fn start_discovery(&self, proxy: &WpaP2PDeviceProxy<'_>) -> Result<()> {
+        // `listen_secs` is a u32; P2PDevice.Listen expects i32 (D-Bus type `i`).
         // Clamp to i32::MAX to avoid silent wrapping on implausibly large values.
         let timeout_secs = i32::try_from(self.cfg.p2p.listen_secs).unwrap_or(i32::MAX);
 

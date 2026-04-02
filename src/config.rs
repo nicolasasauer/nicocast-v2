@@ -252,10 +252,9 @@ impl Config {
         // warn the user so the conflict is visible at startup.
         if self.airplay_enabled {
             warn!(
-                "airplay_enabled = true: AirPlay (uxplay) and Miracast (P2P) both \
-                 require exclusive control of the WiFi interface ('{}').  \
-                 Running both simultaneously will cause connectivity failures.  \
-                 Disable one mode or use separate interfaces.",
+                "airplay_enabled = true: AirPlay (uxplay) and Miracast (P2P) both require \
+                 exclusive control of WiFi interface '{}'. Running both simultaneously will \
+                 cause connectivity failures. Disable one mode or use separate interfaces.",
                 self.wifi_interface
             );
         }
