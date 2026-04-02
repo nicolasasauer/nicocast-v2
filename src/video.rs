@@ -19,6 +19,17 @@
 //! udpsrc → tsdemux → h264parse → avdec_h264 → autovideosink
 //! ```
 //!
+//! # Audio
+//!
+//! Audio is **intentionally not supported**.  `tsdemux` will generate pads for
+//! any AAC or LPCM elementary streams present in the MPEG-TS container, but no
+//! audio branch is wired up in the `pad-added` handler.  Those pads are simply
+//! left unlinked and the audio data is discarded.
+//!
+//! The `wfd_audio_codecs` parameter advertised during the RTSP M3 exchange
+//! (`LPCM 00000003 00`) is present to satisfy the WFD specification handshake
+//! requirements; it does not imply actual audio playback.
+//!
 //! # gstreamer-rs 0.25 compatibility notes
 //!
 //! * `Bin::add_many()` accepts `&[&impl IsA<Element>]`.

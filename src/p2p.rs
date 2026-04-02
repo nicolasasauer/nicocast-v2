@@ -469,9 +469,24 @@ impl P2pManager {
         let retry_delay = tokio::time::Duration::from_secs(self.cfg.p2p.connect_retry_secs);
 
         loop {
-            self.configure_wfd_ies().await;
+            // Build the D-Bus proxy once per outer iteration so that the
+            // introspection round-trip is not repeated on every refresh cycle.
+            let proxy = match self.p2p_proxy().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        "Could not build P2PDevice proxy: {e:#}; \
+                         retrying in {}s",
+                        self.cfg.p2p.connect_retry_secs
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+            };
 
-            if let Err(e) = self.configure_p2p_device_config().await {
+            self.configure_wfd_ies(&proxy).await;
+
+            if let Err(e) = self.configure_p2p_device_config(&proxy).await {
                 warn!(
                     "P2P device config failed: {e:#}; \
                      retrying in {}s",
@@ -481,7 +496,7 @@ impl P2pManager {
                 continue;
             }
 
-            if let Err(e) = self.start_discovery().await {
+            if let Err(e) = self.start_discovery(&proxy).await {
                 warn!(
                     "P2P discovery start failed: {e:#}; \
                      retrying in {}s",
@@ -504,7 +519,7 @@ impl P2pManager {
                 ))
                 .await;
                 debug!("Refreshing P2P listen window");
-                if let Err(e) = self.start_discovery().await {
+                if let Err(e) = self.start_discovery(&proxy).await {
                     warn!(
                         "Failed to refresh P2P discovery: {e}; \
                          restarting P2P configuration"
@@ -526,7 +541,7 @@ impl P2pManager {
     /// `wpa_cli wfd_subelem_set`.  If that also fails a warning is logged and
     /// the manager continues without WFD IEs.  P2P discovery will still work
     /// but Samsung Smart View may not recognise the sink as a Miracast display.
-    async fn configure_wfd_ies(&self) {
+    async fn configure_wfd_ies(&self, proxy: &WpaP2PDeviceProxy<'_>) {
         let ie_bytes = match hex_to_bytes(&self.cfg.p2p.wfd_subelems)
             .context("decoding wfd_subelems hex string")
         {
@@ -543,21 +558,16 @@ impl P2pManager {
             self.cfg.p2p.wfd_subelems
         );
 
-        match self.p2p_proxy().await {
-            Ok(proxy) => match proxy.set_wfd_ies(&ie_bytes).await {
-                Ok(()) => {
-                    debug!("WFDIEs set via D-Bus successfully");
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "org.freedesktop.DBus.Properties.Set WFDIEs failed ({e}); \
-                         trying wpa_cli fallback"
-                    );
-                }
-            },
+        match proxy.set_wfd_ies(&ie_bytes).await {
+            Ok(()) => {
+                debug!("WFDIEs set via D-Bus successfully");
+                return;
+            }
             Err(e) => {
-                warn!("Could not build P2PDevice proxy for WFDIEs ({e}); trying wpa_cli fallback");
+                warn!(
+                    "org.freedesktop.DBus.Properties.Set WFDIEs failed ({e}); \
+                     trying wpa_cli fallback"
+                );
             }
         }
 
@@ -629,7 +639,7 @@ impl P2pManager {
     /// | `DeviceName` | `s` | human-readable sink name (shown in Smart View) |
     /// | `PrimaryDeviceType` | `ay` | 8-byte WPS blob for `7-0050F204-1` |
     /// | `NoGroupIface` | `b` | `false` → `p2p_no_group_iface=0` |
-    async fn configure_p2p_device_config(&self) -> Result<()> {
+    async fn configure_p2p_device_config(&self, proxy: &WpaP2PDeviceProxy<'_>) -> Result<()> {
         let dev_type_bytes = wps_dev_type_to_bytes(&self.cfg.p2p.wps_dev_type)
             .context("encoding WPS primary device type")?;
 
@@ -661,8 +671,7 @@ impl P2pManager {
         .into_iter()
         .collect();
 
-        self.p2p_proxy()
-            .await?
+        proxy
             .set_p2p_device_config(config)
             .await
             .context(
@@ -674,9 +683,10 @@ impl P2pManager {
     }
 
     /// Start P2P peer discovery followed by a listen window.
-    async fn start_discovery(&self) -> Result<()> {
-        let proxy = self.p2p_proxy().await?;
-        let timeout_secs = self.cfg.p2p.listen_secs as i32;
+    async fn start_discovery(&self, proxy: &WpaP2PDeviceProxy<'_>) -> Result<()> {
+        // `listen_secs` is a u32; P2PDevice.Listen expects i32 (D-Bus type `i`).
+        // Clamp to i32::MAX to avoid silent wrapping on implausibly large values.
+        let timeout_secs = i32::try_from(self.cfg.p2p.listen_secs).unwrap_or(i32::MAX);
 
         proxy
             .find(HashMap::new())

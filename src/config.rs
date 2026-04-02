@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use tracing::warn;
 
 /// Top-level application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,8 +219,46 @@ impl Config {
     ///
     /// Currently checks:
     /// * `p2p.wfd_subelems` must be a non-empty, even-length hex string.
+    /// * `rtsp_port`, `rtp_port`, and `health_port` must not collide with each
+    ///   other (when non-zero).
+    /// * `airplay_enabled = true` with P2P active is warned about because both
+    ///   modes require exclusive use of the same `wlan0` interface.
     pub fn validate(&self) -> Result<()> {
         validate_hex_field("p2p.wfd_subelems", &self.p2p.wfd_subelems)?;
+
+        // Port collision checks (skip health_port = 0, which disables it).
+        if self.rtsp_port == self.rtp_port {
+            bail!(
+                "rtsp_port ({}) and rtp_port ({}) must not be the same",
+                self.rtsp_port, self.rtp_port
+            );
+        }
+        if self.health_port != 0 {
+            if self.health_port == self.rtsp_port {
+                bail!(
+                    "health_port ({}) and rtsp_port ({}) must not be the same",
+                    self.health_port, self.rtsp_port
+                );
+            }
+            if self.health_port == self.rtp_port {
+                bail!(
+                    "health_port ({}) and rtp_port ({}) must not be the same",
+                    self.health_port, self.rtp_port
+                );
+            }
+        }
+
+        // AirPlay and Miracast (P2P) both require exclusive use of wlan0;
+        // warn the user so the conflict is visible at startup.
+        if self.airplay_enabled {
+            warn!(
+                "airplay_enabled = true: AirPlay (uxplay) and Miracast (P2P) both require \
+                 exclusive control of WiFi interface '{}'. Running both simultaneously will \
+                 cause connectivity failures. Disable one mode or use separate interfaces.",
+                self.wifi_interface
+            );
+        }
+
         Ok(())
     }
 }
@@ -312,5 +351,35 @@ mod tests {
         let mut cfg = Config::default();
         cfg.p2p.wfd_subelems = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rtsp_rtp_port_collision() {
+        let mut cfg = Config::default();
+        cfg.rtp_port = cfg.rtsp_port;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_health_rtsp_port_collision() {
+        let mut cfg = Config::default();
+        cfg.health_port = cfg.rtsp_port;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_health_rtp_port_collision() {
+        let mut cfg = Config::default();
+        cfg.health_port = cfg.rtp_port;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_health_port_zero() {
+        let mut cfg = Config::default();
+        // health_port = 0 disables health endpoint; port "collision" checks
+        // must not fire for the disabled port.
+        cfg.health_port = 0;
+        assert!(cfg.validate().is_ok());
     }
 }
