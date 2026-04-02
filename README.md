@@ -57,6 +57,24 @@ ssh pi@192.168.7.2 'sudo journalctl -u nicocast -f --no-pager -o short-iso'
 Re-running `./setup.sh` is safe and idempotent.  It downloads the newest
 release binary, re-installs it, and restarts the service.
 
+### Pre-flight check
+
+The binary includes a `--check` mode that verifies all prerequisites before
+starting the service:
+
+```bash
+nicocast --check
+```
+
+It checks:
+- Config file is valid (hex field, port collisions)
+- WiFi interface exists in sysfs
+- GStreamer H.264 decoder is available (hardware `v4l2h264dec` or software fallback `avdec_h264`)
+- RTSP and health ports are not already in use
+- wpa_supplicant socket directory is present
+
+Exit code `0` = all critical checks passed; `1` = at least one critical check failed.
+
 ---
 
 ## Developer Workflow — from a Laptop (Docker mode)
@@ -99,7 +117,8 @@ cd nicocast-v2
                                                         │  ┌────────────────────────────────────┐  │
                                                         │  │         GStreamer Pipeline          │  │
                                                         │  │  udpsrc → tsdemux → h264parse →    │  │
-                                                        │  │  v4l2h264dec → autovideosink       │  │
+                                                        │  │  v4l2h264dec (HW) / avdec_h264     │  │
+                                                        │  │  (SW fallback) → autovideosink     │  │
                                                         │  └────────────────────────────────────┘  │
                                                         │                                          │
                                                         │  usb0  ◄── USB Ethernet Gadget ──────►  │
@@ -126,7 +145,8 @@ remains available regardless of WiFi activity.
 | Board | Raspberry Pi Zero 2W (BCM2710A1, Cortex-A53 64-bit) |
 | OS | Raspberry Pi OS **Bookworm** 64-bit (or any Debian Bookworm aarch64) |
 | USB port | The micro-USB port labelled **USB** (OTG port) — *not* the PWR IN port |
-| GStreamer | `gstreamer1.0-plugins-good` + `gstreamer1.0-plugins-bad` (runtime) |
+| GStreamer (HW) | `gstreamer1.0-plugins-good` + `gstreamer1.0-plugins-bad` (hardware V4L2 decoder) |
+| GStreamer (SW) | `gstreamer1.0-libav` (optional software fallback decoder `avdec_h264`) |
 | wpa_supplicant | ≥ 2.9, D-Bus v2 interface enabled (`CONFIG_CTRL_IFACE_DBUS_NEW=y`) |
 
 ---
@@ -342,8 +362,13 @@ Every push to `main` triggers the GitHub Actions workflow in
 The stable download URL is always:
 
 ```
-https://github.com/nicolasasauer/nicocast-v2/releases/latest/download/nicocast-aarch64
+https://github.com/nicolasasauer/nicocast-v2/releases/download/latest/nicocast-aarch64
 ```
+
+> **Note:** The URL uses the direct tag-based path (`/releases/download/latest/`) rather
+> than the `/releases/latest/download/` redirect.  GitHub's redirect resolves only
+> non-prerelease releases; the rolling `latest` tag is published as a pre-release so
+> using the redirect path causes a 404.
 
 `setup.sh` uses this URL automatically when run on the Pi.
 
@@ -654,3 +679,13 @@ Also ensure the V4L2 codec driver is loaded:
 ls /dev/video*
 v4l2-ctl --list-devices
 ```
+
+If `v4l2h264dec` is unavailable (e.g. on a development machine), NicoCast
+automatically falls back to the software decoder `avdec_h264`.  To install it:
+
+```bash
+sudo apt install gstreamer1.0-libav
+```
+
+Use `nicocast --check` to verify which decoder is detected before starting
+the service.
